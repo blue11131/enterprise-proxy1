@@ -1,0 +1,2028 @@
+package admin
+
+import (
+	"bytes"
+	"compress/gzip"
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/hex"
+	"encoding/json"
+	"encoding/pem"
+	"fmt"
+	"io"
+	"io/fs"
+	"log"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"mitm-proxy/internal/access"
+	"mitm-proxy/internal/admin/auth"
+	"mitm-proxy/internal/admin/ui"
+	cfgpkg "mitm-proxy/internal/config"
+	"mitm-proxy/internal/deployments"
+	"mitm-proxy/internal/events"
+	"mitm-proxy/internal/policy"
+	"mitm-proxy/internal/redact"
+	"mitm-proxy/internal/store"
+)
+
+type Options struct {
+	Addr          string
+	Token         string
+	ReadToken     string
+	UIEnabled     bool
+	Store         *store.Store
+	Config        func() *cfgpkg.Config
+	ConfigPath    string
+	ProxyVersion  string
+	ProxyStarted  time.Time
+	GeneratedAuth bool
+	EventBus   *events.Bus
+	SaveConfig    func(context.Context, *cfgpkg.Config) error
+	ApplyConfig   func(*cfgpkg.Config)
+	ReloadConfig  func(context.Context) error
+	Restart       func(context.Context) error
+	RotateCA      func(context.Context) error
+	ImportCA      func(context.Context, string, string) error
+	PublishEvent  func(events.Event)
+}
+
+type Server struct {
+	options Options
+	server  *http.Server
+}
+
+func New(options Options) *Server {
+	mux := http.NewServeMux()
+	s := &Server{options: options}
+
+	apiMux := http.NewServeMux()
+	apiMux.HandleFunc("/api/health", s.handleHealth)
+	apiMux.HandleFunc("/api/version", s.handleVersion)
+	apiMux.HandleFunc("/api/audit", s.handleAudit)
+	apiMux.HandleFunc("/api/traffic", s.handleTraffic)
+	apiMux.HandleFunc("/api/traffic/stats", s.handleTrafficStats)
+	apiMux.HandleFunc("/api/traffic/export", s.handleTrafficExport)
+	apiMux.HandleFunc("/api/traffic/", s.handleTrafficDetail)
+	apiMux.HandleFunc("/api/traffic/stream", s.handleTrafficStream)
+	apiMux.HandleFunc("/metrics", s.handleMetrics)
+	apiMux.HandleFunc("/api/certificates/ca", s.handleCACertificate)
+	apiMux.HandleFunc("/api/certificates/ca/download", s.handleCACertificateDownload)
+	apiMux.HandleFunc("/api/certificates/ca/rotate", s.handleCARotate)
+	apiMux.HandleFunc("/api/certificates/ca/import", s.handleCAImport)
+	apiMux.HandleFunc("/api/certificates/leaf", s.handleLeafCertificates)
+	apiMux.HandleFunc("/api/deployments", s.handleDeployments)
+	apiMux.HandleFunc("/api/deployments/current", s.handleCurrentDeployment)
+	apiMux.HandleFunc("/api/deployments/current/reload", s.handleDeploymentReload)
+	apiMux.HandleFunc("/api/deployments/current/restart", s.handleDeploymentRestart)
+	apiMux.HandleFunc("/api/logs", s.handleLogs)
+	apiMux.HandleFunc("/api/blocks/test", s.handleBlockTest)
+	apiMux.HandleFunc("/api/blocks/ports", s.handleBlockedPorts)
+	apiMux.HandleFunc("/api/blocks/ports/", s.handleBlockedPortDetail)
+	apiMux.HandleFunc("/api/blocks/domains", s.handleBlockedDomains)
+	apiMux.HandleFunc("/api/blocks/domains/", s.handleBlockedDomainDetail)
+	apiMux.HandleFunc("/api/blocks/ips", s.handleBlockedIPs)
+	apiMux.HandleFunc("/api/blocks/ips/", s.handleBlockedIPDetail)
+	apiMux.HandleFunc("/api/cache/resource", s.handleCacheResource)
+	apiMux.HandleFunc("/api/cache", s.handleCache)
+	apiMux.HandleFunc("/api/cache/purge", s.handleCachePurge)
+	apiMux.HandleFunc("/api/settings/danger", s.handleSettingsDanger)
+	apiMux.HandleFunc("/api/settings", s.handleSettings)
+	apiMux.HandleFunc("/api/proxy-auth/users", s.handleProxyAuthUsers)
+	apiMux.HandleFunc("/api/proxy-auth/users/", s.handleProxyAuthUserDetail)
+	apiMux.HandleFunc("/api/proxy-acl/rules", s.handleProxyACLRules)
+	apiMux.HandleFunc("/api/proxy-acl/rules/", s.handleProxyACLRuleDetail)
+	apiMux.HandleFunc("/api/proxy-acl/test", s.handleProxyACLTest)
+	apiMux.HandleFunc("/api/admin/users", s.handleAdminUsers)
+	apiMux.HandleFunc("/api/admin/users/", s.handleAdminUserDetail)
+	protected := auth.Middleware{Token: options.Token, ReadToken: options.ReadToken}.Wrap(apiMux)
+	mux.Handle("/api/", protected)
+	mux.Handle("/metrics", protected)
+
+	if options.UIEnabled {
+		dist, err := fs.Sub(ui.Dist, "dist")
+		if err != nil {
+			log.Printf("admin UI unavailable: %v", err)
+		} else {
+			fileServer := http.StripPrefix("/admin/", http.FileServer(http.FS(dist)))
+			mux.HandleFunc("/admin/", func(w http.ResponseWriter, r *http.Request) {
+				assetPath := strings.TrimPrefix(r.URL.Path, "/admin/")
+				if assetPath == "" || !strings.Contains(filepath.Base(assetPath), ".") {
+					r.URL.Path = "/admin/"
+				}
+				fileServer.ServeHTTP(w, r)
+			})
+			mux.HandleFunc("/admin", func(w http.ResponseWriter, r *http.Request) {
+				target := "/admin/"
+				if r.URL.RawQuery != "" {
+					target += "?" + r.URL.RawQuery
+				}
+				http.Redirect(w, r, target, http.StatusFound)
+			})
+		}
+	}
+
+	s.server = &http.Server{
+		Addr:              options.Addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	return s
+}
+
+func (s *Server) ListenAndServe() error {
+	if s.options.Store != nil {
+		_ = s.options.Store.AddAudit(context.Background(), "system", "admin.start", map[string]any{
+			"addr": s.options.Addr,
+			"ui":   s.options.UIEnabled,
+		}, "")
+	}
+	s.startEventRecorder()
+	return s.server.ListenAndServe()
+}
+
+func (s *Server) Shutdown(ctx context.Context) error {
+	if s == nil || s.server == nil {
+		return nil
+	}
+	return s.server.Shutdown(ctx)
+}
+
+func (s *Server) startEventRecorder() {
+	if s.options.Store == nil || s.options.EventBus == nil {
+		return
+	}
+	ch, _ := s.options.EventBus.Subscribe("*")
+	go func() {
+		for event := range ch {
+			if err := s.options.Store.RecordEvent(context.Background(), event); err != nil {
+				log.Printf("admin store event record error: %v", err)
+			}
+		}
+	}()
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	cfg := s.options.Config()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "ok",
+		"time":   time.Now().UTC(),
+		"admin": map[string]any{
+			"addr":           s.options.Addr,
+			"ui_enabled":     s.options.UIEnabled,
+			"token_required": s.options.Token != "",
+		},
+		"proxy": map[string]any{
+			"listen_addr":    cfg.ListenAddr,
+			"mitm_enabled":   cfg.EnableMITM,
+			"config_path":    s.options.ConfigPath,
+			"cache_enabled":  cfg.Cache.Enabled,
+			"excluded_count": len(cfg.ExcludedDomains),
+		},
+		"uptime_seconds": int64(time.Since(s.options.ProxyStarted).Seconds()),
+	})
+}
+
+func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"version": s.options.ProxyVersion,
+		"started": s.options.ProxyStarted.UTC(),
+	})
+}
+
+func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
+	if s.options.Store == nil {
+		writeJSON(w, http.StatusOK, []store.AuditEntry{})
+		return
+	}
+
+	entries, err := s.options.Store.ListAudit(r.Context(), 100)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, entries)
+}
+
+func (s *Server) handleTraffic(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodDelete {
+		if s.options.Store == nil {
+			s.handleNotImplemented(w, r)
+			return
+		}
+		if err := s.options.Store.ClearTraffic(r.Context()); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.audit(r, "traffic.clear", nil)
+		writeJSON(w, http.StatusOK, map[string]string{"status": "cleared"})
+		return
+	}
+	if s.options.Store != nil {
+		limit, offset := paginationParams(r, 200)
+		flows, err := s.options.Store.ListTrafficPage(r.Context(), limit, offset, r.URL.Query().Get("q"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, flows)
+		return
+	}
+	if s.options.EventBus == nil {
+		writeJSON(w, http.StatusOK, []events.Event{})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.options.EventBus.Recent("*", 200))
+}
+
+func (s *Server) handleTrafficStats(w http.ResponseWriter, r *http.Request) {
+	if s.options.Store == nil {
+		writeJSON(w, http.StatusOK, store.TrafficStats{})
+		return
+	}
+	stats, err := s.options.Store.TrafficStats(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, stats)
+}
+
+func paginationParams(r *http.Request, defaultLimit int) (int, int) {
+	limit := defaultLimit
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil {
+			limit = parsed
+		}
+	}
+	if limit <= 0 {
+		limit = defaultLimit
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	offset := 0
+	if raw := strings.TrimSpace(r.URL.Query().Get("offset")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			offset = parsed
+		}
+	}
+	return limit, offset
+}
+
+func (s *Server) handleTrafficDetail(w http.ResponseWriter, r *http.Request) {
+	if strings.HasSuffix(r.URL.Path, "/export") {
+		s.handleTrafficDetailExport(w, r)
+		return
+	}
+	id := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/traffic/"), "/")
+	if s.options.Store != nil {
+		flow, ok, err := s.options.Store.GetTrafficDetail(r.Context(), id)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if ok {
+			decodeTrafficBodiesForDisplay(&flow)
+			writeJSON(w, http.StatusOK, flow)
+			return
+		}
+	}
+	if s.options.EventBus != nil {
+		if event, ok := s.options.EventBus.Get(id); ok {
+			writeJSON(w, http.StatusOK, event)
+			return
+		}
+	}
+	writeJSON(w, http.StatusNotFound, map[string]string{"error": "traffic flow not found"})
+}
+
+func (s *Server) handleTrafficDetailExport(w http.ResponseWriter, r *http.Request) {
+	if s.options.Store == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "traffic flow not found"})
+		return
+	}
+	id := strings.Trim(strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/traffic/"), "/export"), "/")
+	flow, ok, err := s.options.Store.GetTrafficDetail(r.Context(), id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "traffic flow not found"})
+		return
+	}
+	decodeTrafficBodiesForDisplay(&flow)
+	if r.URL.Query().Get("format") == "har" {
+		writeDownloadJSON(w, http.StatusOK, "traffic-"+safeFilenamePart(id)+".har", trafficDetailHAR(flow))
+		return
+	}
+	writeDownloadJSON(w, http.StatusOK, "traffic-"+safeFilenamePart(id)+".json", flow)
+}
+
+
+
+
+
+
+
+
+
+func fallbackString(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
+}
+
+
+
+
+
+
+
+
+
+
+
+func splitTrafficHeaders(records []store.HeaderRecord) (http.Header, http.Header) {
+	requestHeaders := http.Header{}
+	responseHeaders := http.Header{}
+	for _, record := range records {
+		if record.Direction == "response" {
+			responseHeaders.Add(record.Name, record.Value)
+			continue
+		}
+		requestHeaders.Add(record.Name, record.Value)
+	}
+	return requestHeaders, responseHeaders
+}
+
+func decodeTrafficBodiesForDisplay(flow *store.TrafficDetail) {
+	if flow == nil {
+		return
+	}
+	requestHeaders, responseHeaders := splitTrafficHeaders(flow.Headers)
+	flow.RequestBody = decodeBodyForDisplay(flow.RequestBody, requestHeaders)
+	flow.ResponseBody = decodeBodyForDisplay(flow.ResponseBody, responseHeaders)
+}
+
+func decodeBodyForDisplay(body string, headers http.Header) string {
+	if body == "" || !contentEncodingIncludes(headers, "gzip") {
+		return body
+	}
+	reader, err := gzip.NewReader(bytes.NewReader([]byte(body)))
+	if err != nil {
+		return body
+	}
+	defer reader.Close()
+	decoded, err := io.ReadAll(reader)
+	if err != nil {
+		return body
+	}
+	return string(decoded)
+}
+
+func contentEncodingIncludes(headers http.Header, encoding string) bool {
+	for _, value := range headers.Values("Content-Encoding") {
+		for _, part := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(part), encoding) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func redactedHeaders(headers http.Header, enabled bool) http.Header {
+	if !enabled {
+		out := http.Header{}
+		for key, values := range headers {
+			out[key] = append([]string(nil), values...)
+		}
+		return out
+	}
+	return redact.RedactHeaders(headers)
+}
+
+func cappedBodySample(body string, limit int64, mask bool) string {
+	if limit <= 0 {
+		limit = 32768
+	}
+	data := []byte(body)
+	if int64(len(data)) > limit {
+		data = data[:limit]
+	}
+	if mask {
+		data = redact.RedactBody(data)
+	}
+	return string(data)
+}
+
+func redactedString(value string, mask bool) string {
+	if !mask {
+		return value
+	}
+	return string(redact.RedactBody([]byte(value)))
+}
+
+func redactedStringValues(values []string, mask bool) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		out = append(out, redactedString(value, mask))
+	}
+	return out
+}
+
+
+
+func (s *Server) handleTrafficExport(w http.ResponseWriter, r *http.Request) {
+	if s.options.Store == nil {
+		writeJSON(w, http.StatusOK, []store.TrafficFlow{})
+		return
+	}
+	flows, err := s.options.Store.ListTraffic(r.Context(), 1000)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if r.URL.Query().Get("format") == "har" {
+		s.audit(r, "traffic.export", map[string]any{"format": "har", "count": len(flows)})
+		writeDownloadJSON(w, http.StatusOK, "traffic.har", trafficHAR(flows))
+		return
+	}
+
+	s.audit(r, "traffic.export", map[string]any{"format": "json", "count": len(flows)})
+	writeDownloadJSON(w, http.StatusOK, "traffic.json", flows)
+}
+
+func (s *Server) handleTrafficStream(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	fmt.Fprintf(w, "event: ready\ndata: {}\n\n")
+	flusher.Flush()
+	if s.options.EventBus == nil {
+		<-r.Context().Done()
+		return
+	}
+
+	ch, cancel := s.options.EventBus.Subscribe("*")
+	defer cancel()
+	for {
+		select {
+		case event := <-ch:
+			data, _ := json.Marshal(event)
+			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event.Topic, data)
+			flusher.Flush()
+		case <-r.Context().Done():
+			return
+		}
+	}
+}
+
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	cfg := s.options.Config()
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	fmt.Fprintf(w, "# HELP mitm_proxy_uptime_seconds Seconds since proxy startup.\n")
+	fmt.Fprintf(w, "# TYPE mitm_proxy_uptime_seconds gauge\n")
+	fmt.Fprintf(w, "mitm_proxy_uptime_seconds %d\n", int64(time.Since(s.options.ProxyStarted).Seconds()))
+	fmt.Fprintf(w, "# HELP mitm_proxy_admin_enabled Admin server enabled flag.\n")
+	fmt.Fprintf(w, "# TYPE mitm_proxy_admin_enabled gauge\n")
+	fmt.Fprintf(w, "mitm_proxy_admin_enabled 1\n")
+	fmt.Fprintf(w, "# HELP mitm_proxy_mitm_enabled MITM enabled flag.\n")
+	fmt.Fprintf(w, "# TYPE mitm_proxy_mitm_enabled gauge\n")
+	if cfg.EnableMITM {
+		fmt.Fprintf(w, "mitm_proxy_mitm_enabled 1\n")
+	} else {
+		fmt.Fprintf(w, "mitm_proxy_mitm_enabled 0\n")
+	}
+	if s.options.Store != nil {
+		stats, err := s.options.Store.TrafficStats(r.Context())
+		if err == nil {
+			fmt.Fprintf(w, "# HELP mitm_proxy_traffic_flows_total Captured traffic flow count.\n")
+			fmt.Fprintf(w, "# TYPE mitm_proxy_traffic_flows_total counter\n")
+			fmt.Fprintf(w, "mitm_proxy_traffic_flows_total %d\n", stats.Total)
+			fmt.Fprintf(w, "# HELP mitm_proxy_traffic_blocked_total Blocked traffic flow count.\n")
+			fmt.Fprintf(w, "# TYPE mitm_proxy_traffic_blocked_total counter\n")
+			fmt.Fprintf(w, "mitm_proxy_traffic_blocked_total %d\n", stats.Blocked)
+			fmt.Fprintf(w, "# HELP mitm_proxy_cache_hits_total Cached traffic hit count.\n")
+			fmt.Fprintf(w, "# TYPE mitm_proxy_cache_hits_total counter\n")
+			fmt.Fprintf(w, "mitm_proxy_cache_hits_total %d\n", stats.CacheHit)
+		}
+	}
+}
+
+func (s *Server) handleCACertificate(w http.ResponseWriter, r *http.Request) {
+	cert, path, err := s.loadCACert()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+
+	fingerprint := sha256.Sum256(cert.Raw)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"subject":     cert.Subject.String(),
+		"issuer":      cert.Issuer.String(),
+		"fingerprint": strings.ToUpper(hex.EncodeToString(fingerprint[:])),
+		"created_at":  cert.NotBefore,
+		"expires_at":  cert.NotAfter,
+		"path":        path,
+	})
+}
+
+func (s *Server) handleCACertificateDownload(w http.ResponseWriter, r *http.Request) {
+	_, path, err := s.loadCACert()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/x-pem-file")
+	w.Header().Set("Content-Disposition", `attachment; filename="ca-cert.pem"`)
+	http.ServeFile(w, r, path)
+}
+
+func (s *Server) handleCARotate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.options.RotateCA == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	if err := s.options.RotateCA(r.Context()); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.audit(r, "certificates.ca.rotate", nil)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "rotated"})
+}
+
+func (s *Server) handleCAImport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.options.ImportCA == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+
+	var input struct {
+		CertPath string `json:"cert_path"`
+		KeyPath  string `json:"key_path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(input.CertPath) == "" || strings.TrimSpace(input.KeyPath) == "" {
+		http.Error(w, "cert_path and key_path are required", http.StatusBadRequest)
+		return
+	}
+	if err := s.options.ImportCA(r.Context(), input.CertPath, input.KeyPath); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.audit(r, "certificates.ca.import", map[string]any{"cert_path": input.CertPath})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "imported"})
+}
+
+func (s *Server) handleLeafCertificates(w http.ResponseWriter, r *http.Request) {
+	if s.options.Store == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"items": []any{}, "total": 0, "has_more": false})
+		return
+	}
+	limit, offset := paginationParams(r, 10)
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	page, err := s.options.Store.ListCertificatesPage(r.Context(), limit, offset, query)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"items":    page.Items,
+		"total":    page.Total,
+		"has_more": page.HasMore,
+		"limit":    limit,
+		"offset":   offset,
+		"q":        query,
+	})
+}
+
+func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"current":  s.currentDeployment(),
+		"profiles": deployments.DefaultProfiles(),
+	})
+}
+
+func (s *Server) handleCurrentDeployment(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.currentDeployment())
+}
+
+func (s *Server) handleDeploymentReload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.options.ReloadConfig == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	if err := s.options.ReloadConfig(r.Context()); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.audit(r, "deployment.reload", map[string]any{"config_path": s.options.ConfigPath})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "reloaded"})
+}
+
+func (s *Server) handleDeploymentRestart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.options.Restart == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	if err := s.options.Restart(r.Context()); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.audit(r, "deployment.restart", map[string]any{"config_path": s.options.ConfigPath})
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "restarting"})
+}
+
+func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
+	paths := []string{}
+	lines := []string{}
+	for _, path := range paths {
+		if strings.TrimSpace(path) == "" {
+			continue
+		}
+		read, err := tailFile(path, 200)
+		if err == nil {
+			lines = append(lines, read...)
+		}
+	}
+	writeJSON(w, http.StatusOK, lines)
+}
+
+func (s *Server) handleBlockedPorts(w http.ResponseWriter, r *http.Request) {
+	cfg := s.options.Config()
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, cfg.BlockedPorts)
+	case http.MethodPost:
+		var input struct {
+			Port int `json:"port"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil || input.Port <= 0 || input.Port > 65535 {
+			http.Error(w, "invalid port", http.StatusBadRequest)
+			return
+		}
+		for _, port := range cfg.BlockedPorts {
+			if port == input.Port {
+				writeJSON(w, http.StatusOK, cfg.BlockedPorts)
+				return
+			}
+		}
+		cfg.BlockedPorts = append(cfg.BlockedPorts, input.Port)
+		s.audit(r, "blocks.ports.add", map[string]any{"port": input.Port})
+		writeJSON(w, http.StatusCreated, cfg.BlockedPorts)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleBlockedPortDetail(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	portText := strings.TrimPrefix(r.URL.Path, "/api/blocks/ports/")
+	var port int
+	if _, err := fmt.Sscanf(portText, "%d", &port); err != nil {
+		http.Error(w, "invalid port", http.StatusBadRequest)
+		return
+	}
+	cfg := s.options.Config()
+	cfg.BlockedPorts = removeInt(cfg.BlockedPorts, port)
+	s.audit(r, "blocks.ports.delete", map[string]any{"port": port})
+	writeJSON(w, http.StatusOK, cfg.BlockedPorts)
+}
+
+func (s *Server) handleBlockedDomains(w http.ResponseWriter, r *http.Request) {
+	cfg := s.options.Config()
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, cfg.BlockedDomains)
+	case http.MethodPost:
+		var input struct {
+			Pattern string `json:"pattern"`
+			Domain  string `json:"domain"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+		pattern := strings.TrimSpace(input.Pattern)
+		if pattern == "" {
+			pattern = strings.TrimSpace(input.Domain)
+		}
+		if pattern == "" {
+			http.Error(w, "missing domain pattern", http.StatusBadRequest)
+			return
+		}
+		cfg.BlockedDomains = appendUniqueString(cfg.BlockedDomains, pattern)
+		s.audit(r, "blocks.domains.add", map[string]any{"pattern": pattern})
+		writeJSON(w, http.StatusCreated, cfg.BlockedDomains)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleBlockedDomainDetail(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	pattern := strings.TrimPrefix(r.URL.Path, "/api/blocks/domains/")
+	cfg := s.options.Config()
+	cfg.BlockedDomains = removeString(cfg.BlockedDomains, pattern)
+	s.audit(r, "blocks.domains.delete", map[string]any{"pattern": pattern})
+	writeJSON(w, http.StatusOK, cfg.BlockedDomains)
+}
+
+func (s *Server) handleBlockedIPs(w http.ResponseWriter, r *http.Request) {
+	cfg := s.options.Config()
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, cfg.BlockedIPs)
+	case http.MethodPost:
+		var input struct {
+			Pattern string `json:"pattern"`
+			IP      string `json:"ip"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+		pattern := strings.TrimSpace(input.Pattern)
+		if pattern == "" {
+			pattern = strings.TrimSpace(input.IP)
+		}
+		if net.ParseIP(pattern) == nil {
+			if _, _, err := net.ParseCIDR(pattern); err != nil {
+				http.Error(w, "invalid IP or CIDR", http.StatusBadRequest)
+				return
+			}
+		}
+		cfg.BlockedIPs = appendUniqueString(cfg.BlockedIPs, pattern)
+		s.audit(r, "blocks.ips.add", map[string]any{"pattern": pattern})
+		writeJSON(w, http.StatusCreated, cfg.BlockedIPs)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleBlockedIPDetail(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	pattern := strings.TrimPrefix(r.URL.Path, "/api/blocks/ips/")
+	cfg := s.options.Config()
+	cfg.BlockedIPs = removeString(cfg.BlockedIPs, pattern)
+	s.audit(r, "blocks.ips.delete", map[string]any{"pattern": pattern})
+	writeJSON(w, http.StatusOK, cfg.BlockedIPs)
+}
+
+func (s *Server) handleBlockTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var input struct {
+		Host string `json:"host"`
+		Port int    `json:"port"`
+		IP   string `json:"ip"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+
+	cfg := s.options.Config()
+	engine := policy.New(cfg.BlockedPorts, cfg.BlockedDomains, cfg.BlockedIPs)
+	decisions := []policy.BlockDecision{
+		engine.CheckPort(input.Port),
+		engine.CheckDomain(input.Host),
+	}
+	if parsedIP := net.ParseIP(input.IP); parsedIP != nil {
+		decisions = append(decisions, engine.CheckIP(parsedIP))
+	}
+
+	for _, decision := range decisions {
+		if decision.Blocked {
+			writeJSON(w, http.StatusOK, decision)
+			return
+		}
+	}
+
+	writeJSON(w, http.StatusOK, policy.BlockDecision{})
+}
+
+func (s *Server) handleCache(w http.ResponseWriter, r *http.Request) {
+	cfg := s.options.Config()
+	limit, offset := paginationParams(r, 10)
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	size, count := cacheStats(cfg.Cache.Directory)
+	page := cacheEntries(cfg.Cache.Directory, limit, offset, query)
+	var items any = page.Items
+	itemsTotal := page.Total
+	hasMore := page.HasMore
+	if s.options.Store != nil {
+		if storeSize, storeCount, err := s.options.Store.CacheStats(r.Context()); err == nil {
+			size = storeSize
+			count = storeCount
+		}
+		if storePage, err := s.options.Store.ListCacheEntries(r.Context(), limit, offset, query); err == nil {
+			items = storePage.Items
+			itemsTotal = storePage.Total
+			hasMore = storePage.HasMore
+		}
+	}
+	location := cfg.Cache.Directory
+	if s.options.Store != nil {
+		location = cfg.AdminStore
+	}
+	payload := map[string]any{
+		"enabled":     cfg.Cache.Enabled,
+		"directory":   location,
+		"ttl":         cfg.Cache.TTL,
+		"size":        size,
+		"entries":     count,
+		"items":       items,
+		"items_total": itemsTotal,
+		"has_more":    hasMore,
+		"limit":       limit,
+		"offset":      offset,
+		"q":           query,
+	}
+	if s.options.Store != nil {
+		if stats, err := s.options.Store.TrafficStats(r.Context()); err == nil {
+			payload["hits"] = stats.CacheHit
+			payload["misses"] = stats.Total - stats.CacheHit
+		}
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func (s *Server) handleCacheResource(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	key := strings.TrimSpace(r.URL.Query().Get("key"))
+	if !isCacheKey(key) {
+		http.Error(w, "invalid cache key", http.StatusBadRequest)
+		return
+	}
+
+	if s.options.Store != nil {
+		entry, err := s.options.Store.LoadCacheEntry(r.Context(), key)
+		if err != nil {
+			http.Error(w, "cached resource not found", http.StatusNotFound)
+			return
+		}
+		writeCachedResource(w, entry.URL, entry.Status, entry.Headers, entry.Body)
+		return
+	}
+
+	cfg := s.options.Config()
+	cached, err := cachedResponseByKey(cfg.Cache.Directory, key)
+	if err != nil {
+		http.Error(w, "cached resource not found", http.StatusNotFound)
+		return
+	}
+	writeCachedResource(w, cached.URL, cached.Status, cached.Header, cached.Body)
+}
+
+func writeCachedResource(w http.ResponseWriter, rawURL string, status int, headers http.Header, body []byte) {
+	contentType := headers.Get("Content-Type")
+	if contentType == "" {
+		contentType = http.DetectContentType(body)
+	}
+
+	w.Header().Set("Content-Type", contentType)
+	copyCachedResourceHeader(w.Header(), headers, "Content-Encoding")
+	copyCachedResourceHeader(w.Header(), headers, "Content-Language")
+	copyCachedResourceHeader(w.Header(), headers, "Content-Location")
+	copyCachedResourceHeader(w.Header(), headers, "ETag")
+	copyCachedResourceHeader(w.Header(), headers, "Last-Modified")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Security-Policy", "sandbox")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if rawURL != "" {
+		w.Header().Set("X-Original-URL", rawURL)
+	}
+
+	if status < 100 || status > 599 {
+		status = http.StatusOK
+	}
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
+}
+
+func copyCachedResourceHeader(dst, src http.Header, name string) {
+	for _, value := range src.Values(name) {
+		dst.Add(name, value)
+	}
+}
+
+func (s *Server) handleCachePurge(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var input struct {
+		Domain string `json:"domain"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&input)
+
+	cfg := s.options.Config()
+	var removed int
+	var err error
+	if s.options.Store != nil {
+		removed, err = s.options.Store.PurgeCache(r.Context(), input.Domain)
+	} else {
+		removed, err = purgeCache(cfg.Cache.Directory, input.Domain)
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.audit(r, "cache.purge", map[string]any{"domain": input.Domain, "removed": removed})
+	writeJSON(w, http.StatusOK, map[string]any{"removed": removed})
+}
+
+func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
+	cfg := cloneConfig(s.options.Config())
+	if r.Method == http.MethodPut {
+		var input struct {
+			EnableMITM      *bool    `json:"enable_mitm"`
+			ExcludedDomains []string `json:"excluded_domains"`
+			VerboseLogging  *bool    `json:"verbose_logging"`
+			LogRequests     *bool    `json:"log_requests"`
+			MinTLSVersion   string   `json:"min_tls_version"`
+			IdleTimeout     *int     `json:"idle_timeout_seconds"`
+			TrafficCapture  *struct {
+				StoreBodies     *bool    `json:"store_bodies"`
+				MaxBodyBytes    *int64   `json:"max_body_bytes"`
+				RedactBodies    *bool    `json:"redact_bodies"`
+				StoreHeaders    *bool    `json:"store_headers"`
+				RedactedHeaders []string `json:"redacted_headers"`
+				StoreCookies    *bool    `json:"store_cookies"`
+				RedactedCookies []string `json:"redacted_cookies"`
+			} `json:"traffic_capture"`
+			ProxyAuth *struct {
+				Enabled                *bool  `json:"enabled"`
+				Realm                  string `json:"realm"`
+				RequireAuthForLoopback *bool  `json:"require_auth_for_loopback"`
+				DefaultAction          string `json:"default_action"`
+			} `json:"proxy_auth"`
+			Cache *struct {
+				Enabled           *bool    `json:"enabled"`
+				Directory         string   `json:"directory"`
+				IncludeDomains    []string `json:"include_domains"`
+				ExcludeDomains    []string `json:"exclude_domains"`
+				IncludeExtensions []string `json:"include_extensions"`
+				ExcludeExtensions []string `json:"exclude_extensions"`
+				TTL               *int     `json:"ttl"`
+			} `json:"cache"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+		if input.EnableMITM != nil {
+			cfg.EnableMITM = *input.EnableMITM
+		}
+		if input.ExcludedDomains != nil {
+			cfg.ExcludedDomains = input.ExcludedDomains
+		}
+		if input.VerboseLogging != nil {
+			cfg.VerboseLogging = *input.VerboseLogging
+		}
+		if input.LogRequests != nil {
+			cfg.LogRequests = *input.LogRequests
+		}
+		if input.MinTLSVersion != "" {
+			cfg.MinTLSVersion = input.MinTLSVersion
+		}
+		if input.IdleTimeout != nil {
+			cfg.IdleConnTimeout = *input.IdleTimeout
+		}
+		if input.TrafficCapture != nil {
+			if input.TrafficCapture.StoreBodies != nil {
+				cfg.TrafficCapture.StoreBodies = *input.TrafficCapture.StoreBodies
+			}
+			if input.TrafficCapture.MaxBodyBytes != nil {
+				cfg.TrafficCapture.MaxBodyBytes = *input.TrafficCapture.MaxBodyBytes
+			}
+			if input.TrafficCapture.RedactBodies != nil {
+				cfg.TrafficCapture.RedactBodies = *input.TrafficCapture.RedactBodies
+			}
+			if input.TrafficCapture.StoreHeaders != nil {
+				cfg.TrafficCapture.StoreHeaders = *input.TrafficCapture.StoreHeaders
+			}
+			if input.TrafficCapture.RedactedHeaders != nil {
+				cfg.TrafficCapture.RedactedHeaders = input.TrafficCapture.RedactedHeaders
+			}
+			if input.TrafficCapture.StoreCookies != nil {
+				cfg.TrafficCapture.StoreCookies = *input.TrafficCapture.StoreCookies
+			}
+			if input.TrafficCapture.RedactedCookies != nil {
+				cfg.TrafficCapture.RedactedCookies = input.TrafficCapture.RedactedCookies
+			}
+		}
+		if input.ProxyAuth != nil {
+			if input.ProxyAuth.Enabled != nil {
+				cfg.ProxyAuth.Enabled = *input.ProxyAuth.Enabled
+			}
+			if input.ProxyAuth.Realm != "" {
+				cfg.ProxyAuth.Realm = input.ProxyAuth.Realm
+			}
+			if input.ProxyAuth.RequireAuthForLoopback != nil {
+				cfg.ProxyAuth.RequireAuthForLoopback = *input.ProxyAuth.RequireAuthForLoopback
+			}
+			if input.ProxyAuth.DefaultAction != "" {
+				cfg.ProxyAuth.DefaultAction = input.ProxyAuth.DefaultAction
+			}
+		}
+		if input.Cache != nil {
+			if input.Cache.Enabled != nil {
+				cfg.Cache.Enabled = *input.Cache.Enabled
+			}
+			if input.Cache.Directory != "" {
+				cfg.Cache.Directory = input.Cache.Directory
+			}
+			if input.Cache.IncludeDomains != nil {
+				cfg.Cache.IncludeDomains = input.Cache.IncludeDomains
+			}
+			if input.Cache.ExcludeDomains != nil {
+				cfg.Cache.ExcludeDomains = input.Cache.ExcludeDomains
+			}
+			if input.Cache.IncludeExtensions != nil {
+				cfg.Cache.IncludeExtensions = input.Cache.IncludeExtensions
+			}
+			if input.Cache.ExcludeExtensions != nil {
+				cfg.Cache.ExcludeExtensions = input.Cache.ExcludeExtensions
+			}
+			if input.Cache.TTL != nil {
+				cfg.Cache.TTL = *input.Cache.TTL
+			}
+		}
+		if err := cfg.NormalizeAndValidate(); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if s.options.Store != nil {
+			_ = s.options.Store.SetSetting(r.Context(), "runtime_config", safeSettings(cfg))
+		}
+		if s.options.SaveConfig != nil {
+			if err := s.options.SaveConfig(r.Context(), cfg); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			s.audit(r, "settings.persist", map[string]any{"config_path": s.options.ConfigPath})
+		}
+		if s.options.ApplyConfig != nil {
+			s.options.ApplyConfig(cfg)
+		}
+		if s.options.PublishEvent != nil {
+			s.options.PublishEvent(events.Event{
+				Topic: events.TopicConfigUpdated,
+				Time:  time.Now().UTC(),
+				Payload: map[string]any{
+					"source": "admin.settings",
+				},
+			})
+		}
+		s.audit(r, "settings.update", safeSettings(cfg))
+		writeJSON(w, http.StatusOK, safeSettings(cfg))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, safeSettings(cfg))
+}
+
+func (s *Server) handleSettingsDanger(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	var input struct {
+		Action  string `json:"action"`
+		Confirm bool   `json:"confirm"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	if !input.Confirm {
+		http.Error(w, "confirmation is required", http.StatusBadRequest)
+		return
+	}
+	action := strings.ToLower(strings.TrimSpace(input.Action))
+	switch action {
+	case "all":
+		if err := s.options.Store.PurgeResearchData(r.Context(), true); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.audit(r, "settings.danger.purge_all", nil)
+		writeJSON(w, http.StatusOK, map[string]string{"status": "purged", "action": action})
+	case "except_cache":
+		if err := s.options.Store.PurgeResearchData(r.Context(), false); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.audit(r, "settings.danger.purge_except_cache", nil)
+		writeJSON(w, http.StatusOK, map[string]string{"status": "purged", "action": action})
+	case "cache":
+		removed, err := s.options.Store.PurgeCache(r.Context(), "")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.audit(r, "settings.danger.purge_cache", map[string]any{"removed": removed})
+		writeJSON(w, http.StatusOK, map[string]any{"status": "purged", "action": action, "removed": removed})
+	default:
+		http.Error(w, "unknown dangerous action", http.StatusBadRequest)
+	}
+}
+
+func (s *Server) handleProxyAuthUsers(w http.ResponseWriter, r *http.Request) {
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		users, err := s.options.Store.ListProxyUsers(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, users)
+	case http.MethodPost:
+		var input struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+			Role     string `json:"role"`
+			Enabled  *bool  `json:"enabled"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+		hash, err := access.HashPassword(input.Password)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		enabled := true
+		if input.Enabled != nil {
+			enabled = *input.Enabled
+		}
+		role := strings.ToLower(strings.TrimSpace(input.Role))
+		if role == "" {
+			role = "guest"
+		}
+		user, err := s.options.Store.CreateProxyUser(r.Context(), store.ProxyUser{Username: input.Username, PasswordHash: hash, Role: role, Enabled: enabled})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		s.audit(r, "proxy_auth.users.create", map[string]any{"id": user.ID, "username": user.Username})
+		writeJSON(w, http.StatusCreated, user)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleProxyAuthUserDetail(w http.ResponseWriter, r *http.Request) {
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	path := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/proxy-auth/users/"), "/")
+	if strings.HasSuffix(path, "/reset-password") {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		id := strings.TrimSuffix(path, "/reset-password")
+		id = strings.Trim(id, "/")
+		var input struct {
+			Password string `json:"password"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+		hash, err := access.HashPassword(input.Password)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		user, err := s.options.Store.ResetProxyUserPassword(r.Context(), id, hash)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		s.audit(r, "proxy_auth.users.reset_password", map[string]any{"id": user.ID, "username": user.Username})
+		writeJSON(w, http.StatusOK, user)
+		return
+	}
+	id := path
+	switch r.Method {
+	case http.MethodPut:
+		var input struct {
+			Username string `json:"username"`
+			Role     string `json:"role"`
+			Enabled  *bool  `json:"enabled"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+		current, ok, err := s.options.Store.GetProxyUser(r.Context(), id)
+		if err != nil || !ok {
+			http.Error(w, "proxy user not found", http.StatusNotFound)
+			return
+		}
+		if input.Username != "" {
+			current.Username = input.Username
+		}
+		if strings.TrimSpace(input.Role) != "" {
+			current.Role = strings.ToLower(strings.TrimSpace(input.Role))
+		}
+		if input.Enabled != nil {
+			current.Enabled = *input.Enabled
+		}
+		user, err := s.options.Store.UpdateProxyUser(r.Context(), current)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		s.audit(r, "proxy_auth.users.update", map[string]any{"id": user.ID, "username": user.Username})
+		writeJSON(w, http.StatusOK, user)
+	case http.MethodDelete:
+		if err := s.options.Store.DeleteProxyUser(r.Context(), id); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.audit(r, "proxy_auth.users.delete", map[string]any{"id": id})
+		writeJSON(w, http.StatusOK, map[string]string{"deleted": id})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleProxyACLRules(w http.ResponseWriter, r *http.Request) {
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		rules, err := s.options.Store.ListProxyACLRules(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, rules)
+	case http.MethodPost:
+		rule, ok := s.decodeProxyACLRule(w, r)
+		if !ok {
+			return
+		}
+		created, err := s.options.Store.CreateProxyACLRule(r.Context(), rule)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		s.audit(r, "proxy_acl.rules.create", map[string]any{"id": created.ID, "action": created.Action})
+		writeJSON(w, http.StatusCreated, created)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleProxyACLRuleDetail(w http.ResponseWriter, r *http.Request) {
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	id := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/proxy-acl/rules/"), "/")
+	switch r.Method {
+	case http.MethodPut:
+		rule, ok := s.decodeProxyACLRule(w, r)
+		if !ok {
+			return
+		}
+		rule.ID = id
+		updated, err := s.options.Store.UpdateProxyACLRule(r.Context(), rule)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		s.audit(r, "proxy_acl.rules.update", map[string]any{"id": updated.ID, "action": updated.Action})
+		writeJSON(w, http.StatusOK, updated)
+	case http.MethodDelete:
+		if err := s.options.Store.DeleteProxyACLRule(r.Context(), id); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.audit(r, "proxy_acl.rules.delete", map[string]any{"id": id})
+		writeJSON(w, http.StatusOK, map[string]string{"deleted": id})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) decodeProxyACLRule(w http.ResponseWriter, r *http.Request) (store.ProxyACLRule, bool) {
+	var rule store.ProxyACLRule
+	if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return store.ProxyACLRule{}, false
+	}
+	if rule.Action == "" {
+		rule.Action = "deny"
+	}
+	if rule.Action != "allow" && rule.Action != "deny" {
+		http.Error(w, "action must be allow or deny", http.StatusBadRequest)
+		return store.ProxyACLRule{}, false
+	}
+	return rule, true
+}
+
+func (s *Server) handleProxyACLTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	var input struct {
+		Username string `json:"username"`
+		RemoteIP string `json:"remote_ip"`
+		Method   string `json:"method"`
+		URL      string `json:"url"`
+		Host     string `json:"host"`
+		Port     int    `json:"port"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	target := input.URL
+	if target == "" {
+		host := input.Host
+		if input.Port > 0 && !strings.Contains(host, ":") {
+			host = net.JoinHostPort(host, strconv.Itoa(input.Port))
+		}
+		target = host
+	}
+	controller := access.NewController(s.options.Config, s.options.Store)
+	decision := controller.Test(r.Context(), input.Username, net.JoinHostPort(stringDefault(input.RemoteIP, "127.0.0.1"), "12345"), stringDefault(input.Method, http.MethodGet), target)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"allowed": decision.Allowed,
+		"rule_id": decision.RuleID,
+		"reason":  decision.Reason,
+		"info":    decision.Info,
+	})
+}
+
+func (s *Server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
+	if s.options.Store == nil {
+		writeJSON(w, http.StatusOK, []store.AdminUser{})
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		users, err := s.options.Store.ListAdminUsers(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, users)
+	case http.MethodPost:
+		var input struct {
+			Name string `json:"name"`
+			Role string `json:"role"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+		name := strings.TrimSpace(input.Name)
+		role := strings.ToLower(strings.TrimSpace(input.Role))
+		if name == "" {
+			http.Error(w, "name is required", http.StatusBadRequest)
+			return
+		}
+		if role == "" {
+			role = "read"
+		}
+		if role != "admin" && role != "read" {
+			http.Error(w, "role must be admin or read", http.StatusBadRequest)
+			return
+		}
+		user, err := s.options.Store.AddAdminUser(r.Context(), name, role)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.audit(r, "admin.users.add", map[string]any{"id": user.ID, "name": user.Name, "role": user.Role})
+		writeJSON(w, http.StatusCreated, user)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleAdminUserDetail(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	idText := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/admin/users/"), "/")
+	id, err := strconv.ParseInt(idText, 10, 64)
+	if err != nil || id <= 0 {
+		http.Error(w, "invalid user id", http.StatusBadRequest)
+		return
+	}
+	if err := s.options.Store.DeleteAdminUser(r.Context(), id); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.audit(r, "admin.users.delete", map[string]any{"id": id})
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": id})
+}
+
+func safeSettings(cfg *cfgpkg.Config) map[string]any {
+	return map[string]any{
+		"listen_addr":          cfg.ListenAddr,
+		"enable_mitm":          cfg.EnableMITM,
+		"excluded_domains":     cfg.ExcludedDomains,
+		"verbose_logging":      cfg.VerboseLogging,
+		"log_requests":         cfg.LogRequests,
+		"min_tls_version":      cfg.MinTLSVersion,
+		"idle_timeout_seconds": cfg.IdleConnTimeout,
+		"cache":                cfg.Cache,
+		"traffic_capture":      cfg.TrafficCapture,
+		"proxy_auth":           cfg.ProxyAuth,
+	}
+}
+
+func cloneConfig(cfg *cfgpkg.Config) *cfgpkg.Config {
+	if cfg == nil {
+		return &cfgpkg.Config{}
+	}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		cloned := *cfg
+		return &cloned
+	}
+	var cloned cfgpkg.Config
+	if err := json.Unmarshal(data, &cloned); err != nil {
+		shallow := *cfg
+		return &shallow
+	}
+	return &cloned
+}
+
+func (s *Server) handleNotImplemented(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusNotImplemented, map[string]string{"error": "not implemented"})
+}
+
+func (s *Server) currentDeployment() map[string]any {
+	cfg := s.options.Config()
+	return map[string]any{
+		"name":         "local",
+		"kind":         "local",
+		"status":       "running",
+		"started_at":   s.options.ProxyStarted,
+		"config_path":  s.options.ConfigPath,
+		"listen_addr":  cfg.ListenAddr,
+		"mitm_enabled": cfg.EnableMITM,
+		"profiles":     deployments.DefaultProfiles(),
+	}
+}
+
+func (s *Server) loadCACert() (*x509.Certificate, string, error) {
+	cfg := s.options.Config()
+	path := cfg.CACertPath
+	if path == "" {
+		path = cfg.CACertOutputPath
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, "", fmt.Errorf("read CA certificate: %w", err)
+	}
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return nil, "", fmt.Errorf("decode CA certificate PEM")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil, "", fmt.Errorf("parse CA certificate: %w", err)
+	}
+	return cert, path, nil
+}
+
+func (s *Server) audit(r *http.Request, action string, details any) {
+	if s.options.Store == nil {
+		return
+	}
+	_ = s.options.Store.AddAudit(r.Context(), "admin", action, details, r.RemoteAddr)
+}
+
+func appendUniqueString(values []string, value string) []string {
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
+func removeString(values []string, value string) []string {
+	out := values[:0]
+	for _, existing := range values {
+		if existing != value {
+			out = append(out, existing)
+		}
+	}
+	return out
+}
+
+func stringDefault(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
+}
+
+func removeInt(values []int, value int) []int {
+	out := values[:0]
+	for _, existing := range values {
+		if existing != value {
+			out = append(out, existing)
+		}
+	}
+	return out
+}
+
+func cacheStats(dir string) (int64, int) {
+	var size int64
+	var entries int
+	if strings.TrimSpace(dir) == "" {
+		return 0, 0
+	}
+	_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		size += info.Size()
+		entries++
+		return nil
+	})
+	return size, entries
+}
+
+type cacheEntriesPage struct {
+	Items   []map[string]any
+	Total   int
+	HasMore bool
+}
+
+func cacheEntries(dir string, limit, offset int, query string) cacheEntriesPage {
+	if strings.TrimSpace(dir) == "" || limit <= 0 {
+		return cacheEntriesPage{Items: []map[string]any{}}
+	}
+	items := []map[string]any{}
+	total := 0
+	needle := strings.ToLower(strings.TrimSpace(query))
+	_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || filepath.Ext(path) != ".json" {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		var cached struct {
+			URL       string `json:"url"`
+			Status    int    `json:"status"`
+			Body      []byte `json:"body"`
+			StoredAt  int64  `json:"stored_at_unix"`
+			ExpiresAt int64  `json:"expires_at_unix"`
+		}
+		if err := json.Unmarshal(data, &cached); err != nil {
+			return nil
+		}
+		if cached.ExpiresAt > 0 && time.Now().Unix() > cached.ExpiresAt {
+			_ = os.Remove(path)
+			return nil
+		}
+		if cached.Status == http.StatusNotModified && len(cached.Body) == 0 {
+			_ = os.Remove(path)
+			return nil
+		}
+		info, _ := d.Info()
+		key := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+		if needle != "" && !cacheEntryMatches(needle, key, cached.URL, cached.Status, cached.ExpiresAt, info) {
+			return nil
+		}
+		total++
+		if total <= offset {
+			return nil
+		}
+		if len(items) >= limit {
+			return nil
+		}
+		item := map[string]any{
+			"path":       path,
+			"key":        key,
+			"view_url":   "/api/cache/resource?key=" + url.QueryEscape(key),
+			"url":        cached.URL,
+			"status":     cached.Status,
+			"stored_at":  time.Unix(cached.StoredAt, 0).UTC(),
+			"expires_at": time.Unix(cached.ExpiresAt, 0).UTC(),
+		}
+		if info != nil {
+			item["size"] = info.Size()
+		}
+		items = append(items, item)
+		return nil
+	})
+	return cacheEntriesPage{
+		Items:   items,
+		Total:   total,
+		HasMore: offset+len(items) < total,
+	}
+}
+
+func cacheEntryMatches(needle, key, rawURL string, status int, expiresAt int64, info fs.FileInfo) bool {
+	haystacks := []string{
+		strings.ToLower(key),
+		strings.ToLower(rawURL),
+		strconv.Itoa(status),
+		time.Unix(expiresAt, 0).UTC().Format(time.RFC3339),
+	}
+	if info != nil {
+		haystacks = append(haystacks, strconv.FormatInt(info.Size(), 10))
+	}
+	for _, value := range haystacks {
+		if strings.Contains(value, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+type cachedResponse struct {
+	URL       string      `json:"url"`
+	Status    int         `json:"status"`
+	Header    http.Header `json:"header"`
+	Body      []byte      `json:"body"`
+	ExpiresAt int64       `json:"expires_at_unix"`
+}
+
+func cachedResponseByKey(dir, key string) (*cachedResponse, error) {
+	if strings.TrimSpace(dir) == "" || !isCacheKey(key) {
+		return nil, os.ErrNotExist
+	}
+	root, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	var found *cachedResponse
+	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || found != nil || filepath.Ext(path) != ".json" {
+			return nil
+		}
+		if !strings.EqualFold(strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)), key) {
+			return nil
+		}
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			return nil
+		}
+		rel, err := filepath.Rel(root, abs)
+		if err != nil || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
+			return nil
+		}
+		data, err := os.ReadFile(abs)
+		if err != nil {
+			return err
+		}
+		var cached cachedResponse
+		if err := json.Unmarshal(data, &cached); err != nil {
+			return err
+		}
+		if cached.ExpiresAt > 0 && time.Now().Unix() > cached.ExpiresAt {
+			_ = os.Remove(abs)
+			return os.ErrNotExist
+		}
+		if cached.Status == http.StatusNotModified && len(cached.Body) == 0 {
+			_ = os.Remove(abs)
+			return os.ErrNotExist
+		}
+		found = &cached
+		return fs.SkipAll
+	})
+	if err != nil && err != fs.SkipAll {
+		return nil, err
+	}
+	if found == nil {
+		return nil, os.ErrNotExist
+	}
+	return found, nil
+}
+
+func isCacheKey(key string) bool {
+	if len(key) != 64 {
+		return false
+	}
+	for _, ch := range key {
+		if (ch < '0' || ch > '9') && (ch < 'a' || ch > 'f') && (ch < 'A' || ch > 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+func purgeCache(dir, domain string) (int, error) {
+	if strings.TrimSpace(dir) == "" {
+		return 0, nil
+	}
+
+	target := dir
+	if strings.TrimSpace(domain) != "" {
+		target = filepath.Join(dir, domain)
+	}
+
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return 0, fmt.Errorf("resolve cache directory: %w", err)
+	}
+	absTarget, err := filepath.Abs(target)
+	if err != nil {
+		return 0, fmt.Errorf("resolve purge target: %w", err)
+	}
+	if absTarget != absDir && !strings.HasPrefix(absTarget, absDir+string(os.PathSeparator)) {
+		return 0, fmt.Errorf("refusing to purge outside cache directory")
+	}
+
+	removed := 0
+	err = filepath.WalkDir(absTarget, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if removeErr := os.Remove(path); removeErr != nil {
+			return removeErr
+		}
+		removed++
+		return nil
+	})
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	return removed, err
+}
+
+func tailFile(path string, limit int) ([]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	lines := strings.Split(strings.TrimRight(string(data), "\r\n"), "\n")
+	if len(lines) > limit {
+		lines = lines[len(lines)-limit:]
+	}
+	return lines, nil
+}
+
+func trafficHAR(flows []store.TrafficFlow) map[string]any {
+	entries := make([]map[string]any, 0, len(flows))
+	for _, flow := range flows {
+		entries = append(entries, trafficHAREntry(flow))
+	}
+	return trafficHARLog(entries)
+}
+
+func trafficDetailHAR(flow store.TrafficDetail) map[string]any {
+	entry := trafficHAREntry(flow.TrafficFlow)
+	request := entry["request"].(map[string]any)
+	response := entry["response"].(map[string]any)
+	request["headers"] = harHeaders(flow.Headers, "request")
+	request["queryString"] = harNameValues(flow.QueryParams)
+	request["cookies"] = harCookies(flow.Cookies)
+	if flow.RequestBody != "" {
+		request["postData"] = map[string]any{
+			"mimeType": "",
+			"text":     flow.RequestBody,
+		}
+		request["bodySize"] = len(flow.RequestBody)
+	}
+	response["headers"] = harHeaders(flow.Headers, "response")
+	if flow.ResponseBody != "" {
+		response["content"] = map[string]any{
+			"size":     len(flow.ResponseBody),
+			"mimeType": flow.MIMEType,
+			"text":     flow.ResponseBody,
+		}
+		response["bodySize"] = len(flow.ResponseBody)
+	}
+	return trafficHARLog([]map[string]any{entry})
+}
+
+func trafficHAREntry(flow store.TrafficFlow) map[string]any {
+	started := flow.CreatedAt.Format(time.RFC3339Nano)
+	return map[string]any{
+		"startedDateTime": started,
+		"time":            flow.DurationMS,
+		"request": map[string]any{
+			"method":      flow.Method,
+			"url":         flow.URL,
+			"httpVersion": flow.Protocol,
+			"headers":     []any{},
+			"queryString": []any{},
+			"cookies":     []any{},
+			"headersSize": -1,
+			"bodySize":    -1,
+		},
+		"response": map[string]any{
+			"status":      flow.Status,
+			"statusText":  http.StatusText(flow.Status),
+			"httpVersion": flow.Protocol,
+			"headers":     []any{},
+			"cookies":     []any{},
+			"content": map[string]any{
+				"size":     flow.Bytes,
+				"mimeType": flow.MIMEType,
+			},
+			"redirectURL":  "",
+			"headersSize":  -1,
+			"bodySize":     flow.Bytes,
+			"_cacheHit":    flow.CacheHit,
+			"_blocked":     flow.Blocked,
+			"_blockRuleID": flow.RuleID,
+		},
+		"cache": map[string]any{},
+		"timings": map[string]any{
+			"send":    0,
+			"wait":    flow.DurationMS,
+			"receive": 0,
+		},
+	}
+}
+
+func trafficHARLog(entries []map[string]any) map[string]any {
+	return map[string]any{
+		"log": map[string]any{
+			"version": "1.2",
+			"creator": map[string]string{
+				"name":    "mitm-proxy",
+				"version": "dev",
+			},
+			"entries": entries,
+		},
+	}
+}
+
+func harHeaders(headers []store.HeaderRecord, direction string) []map[string]string {
+	out := []map[string]string{}
+	for _, header := range headers {
+		if header.Direction != direction {
+			continue
+		}
+		out = append(out, map[string]string{"name": header.Name, "value": header.Value})
+	}
+	return out
+}
+
+func harNameValues(values map[string][]string) []map[string]string {
+	out := []map[string]string{}
+	for name, vals := range values {
+		for _, value := range vals {
+			out = append(out, map[string]string{"name": name, "value": value})
+		}
+	}
+	return out
+}
+
+func harCookies(values map[string]string) []map[string]string {
+	out := []map[string]string{}
+	for name, value := range values {
+		out = append(out, map[string]string{"name": name, "value": value})
+	}
+	return out
+}
+
+func GenerateToken() (string, error) {
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+func IsLocalhost(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	host = strings.Trim(host, "[]")
+	return host == "127.0.0.1" || host == "::1" || host == "localhost" || host == ""
+}
+
+func writeJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(value)
+}
+
+func writeDownloadJSON(w http.ResponseWriter, status int, filename string, value any) {
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, safeFilenamePart(filename)))
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	writeJSON(w, status, value)
+}
+
+func safeFilenamePart(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "download"
+	}
+	var b strings.Builder
+	for _, r := range value {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '.' || r == '-' || r == '_' {
+			b.WriteRune(r)
+			continue
+		}
+		b.WriteByte('-')
+	}
+	out := strings.Trim(b.String(), ".-")
+	if out == "" {
+		return "download"
+	}
+	if len(out) > 120 {
+		return out[:120]
+	}
+	return out
+}

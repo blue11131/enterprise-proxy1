@@ -1,0 +1,17 @@
+# 运行时生成的 CA 证书与私钥（泄露私钥可被用于中间人解密，切勿提交）
+ca-cert.pem
+ca-key.pem
+
+# 运行时数据：SQLite 存储（含密码哈希与抓取的流量）与缓存目录
+*.db
+*.db-shm
+*.db-wal
+cache/
+
+# 前端依赖（dist 为内嵌产物，按项目约定保留提交）
+internal/admin/ui/node_modules/
+
+# 编辑器与构建产物
+.vscode/
+*.log
+*.exe

@@ -1,0 +1,1795 @@
+package store
+
+import (
+	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	cachepkg "mitm-proxy/internal/cache"
+	"mitm-proxy/internal/events"
+
+	_ "modernc.org/sqlite"
+)
+
+var DashboardTables = []string{
+	"traffic_flows",
+	"traffic_headers",
+	"traffic_bodies",
+	"certificates",
+	"blocked_ports",
+	"blocked_domains",
+	"blocked_ips",
+	"deployments",
+	"audit_log",
+	"admin_users",
+	"settings",
+}
+
+type AuditEntry struct {
+	ID        int64           `json:"id"`
+	CreatedAt time.Time       `json:"created_at"`
+	Actor     string          `json:"actor"`
+	Action    string          `json:"action"`
+	Details   json.RawMessage `json:"details,omitempty"`
+	RemoteIP  string          `json:"remote_ip,omitempty"`
+}
+
+type AdminUser struct {
+	ID        int64     `json:"id"`
+	Name      string    `json:"name"`
+	Role      string    `json:"role"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type ProxyUser struct {
+	ID           string     `json:"id"`
+	Username     string     `json:"username"`
+	PasswordHash string     `json:"-"`
+	Role         string     `json:"role"`
+	Enabled      bool       `json:"enabled"`
+	CreatedAt    time.Time  `json:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at"`
+	LastUsedAt   *time.Time `json:"last_used_at,omitempty"`
+}
+
+type ProxyACLRule struct {
+	ID             string    `json:"id"`
+	Priority       int       `json:"priority"`
+	Enabled        bool      `json:"enabled"`
+	Action         string    `json:"action"`
+	Name           string    `json:"name"`
+	Description    string    `json:"description,omitempty"`
+	Users          []string  `json:"users,omitempty"`
+	Roles          []string  `json:"roles,omitempty"`
+	SourceIPs      []string  `json:"source_ips,omitempty"`
+	HostPatterns   []string  `json:"host_patterns,omitempty"`
+	PortPatterns   []string  `json:"port_patterns,omitempty"`
+	MethodPatterns []string  `json:"method_patterns,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}
+
+type TrafficFlow struct {
+	ID         string    `json:"id"`
+	CreatedAt  time.Time `json:"created_at"`
+	Method     string    `json:"method,omitempty"`
+	URL        string    `json:"url,omitempty"`
+	Host       string    `json:"host,omitempty"`
+	Status     int       `json:"status,omitempty"`
+	Protocol   string    `json:"protocol,omitempty"`
+	MIMEType   string    `json:"mime_type,omitempty"`
+	RemoteIP   string    `json:"remote_ip,omitempty"`
+	DurationMS int64     `json:"duration_ms,omitempty"`
+	Bytes      int64     `json:"bytes,omitempty"`
+	CacheHit   bool      `json:"cache_hit,omitempty"`
+	Blocked    bool      `json:"blocked,omitempty"`
+	RuleID     string    `json:"rule_id,omitempty"`
+	ProxyUser  string    `json:"proxy_user,omitempty"`
+}
+
+type HeaderRecord struct {
+	Direction string `json:"direction"`
+	Name      string `json:"name"`
+	Value     string `json:"value"`
+}
+
+type TrafficDetail struct {
+	TrafficFlow
+	Headers      []HeaderRecord      `json:"headers,omitempty"`
+	QueryParams  map[string][]string `json:"query_params,omitempty"`
+	Cookies      map[string]string   `json:"cookies,omitempty"`
+	RequestBody  string              `json:"request_body,omitempty"`
+	ResponseBody string              `json:"response_body,omitempty"`
+}
+
+type CertificateRecord struct {
+	ID          int64     `json:"id"`
+	Host        string    `json:"host,omitempty"`
+	Subject     string    `json:"subject,omitempty"`
+	Fingerprint string    `json:"fingerprint,omitempty"`
+	CreatedAt   time.Time `json:"created_at,omitempty"`
+	ExpiresAt   time.Time `json:"expires_at,omitempty"`
+}
+
+type CertificatePage struct {
+	Items   []CertificateRecord `json:"items"`
+	Total   int                 `json:"total"`
+	HasMore bool                `json:"has_more"`
+}
+
+type TrafficStats struct {
+	Total    int64 `json:"total"`
+	Blocked  int64 `json:"blocked"`
+	CacheHit int64 `json:"cache_hit"`
+}
+
+type Store struct {
+	db      *sql.DB
+	writeMu sync.Mutex
+}
+
+func Open(path string) (*Store, error) {
+	if path == "" {
+		path = "dashboard.db"
+	}
+	if filepath.Ext(path) == "" {
+		path += ".db"
+	}
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite store: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+
+	store := &Store{db: db}
+	if err := store.configureSQLite(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := store.migrate(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+
+	return store, nil
+}
+
+func (s *Store) configureSQLite(ctx context.Context) error {
+	for _, statement := range []string{
+		`PRAGMA busy_timeout = 5000`,
+		`PRAGMA journal_mode = WAL`,
+		`PRAGMA synchronous = NORMAL`,
+		`PRAGMA foreign_keys = ON`,
+	} {
+		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("configure sqlite store %q: %w", statement, err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) Close() error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	return s.db.Close()
+}
+
+func (s *Store) SaveCacheEntry(ctx context.Context, entry cachepkg.StoredEntry) error {
+	if s == nil {
+		return nil
+	}
+	if strings.TrimSpace(entry.Key) == "" || strings.TrimSpace(entry.URL) == "" {
+		return fmt.Errorf("save cache entry: key and url are required")
+	}
+	if entry.Status == http.StatusNotModified && len(entry.Body) == 0 {
+		return nil
+	}
+	if entry.StoredAt.IsZero() {
+		entry.StoredAt = time.Now().UTC()
+	}
+	if entry.ExpiresAt.IsZero() {
+		entry.ExpiresAt = entry.StoredAt
+	}
+	if entry.Host == "" {
+		if parsed, err := url.Parse(entry.URL); err == nil {
+			entry.Host = parsed.Hostname()
+		}
+	}
+	if entry.Headers == nil {
+		entry.Headers = http.Header{}
+	}
+	if entry.Size == 0 {
+		entry.Size = int64(len(entry.Body))
+	}
+	if entry.ContentType == "" {
+		entry.ContentType = entry.Headers.Get("Content-Type")
+	}
+	headersJSON, err := json.Marshal(entry.Headers)
+	if err != nil {
+		return fmt.Errorf("marshal cache headers: %w", err)
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO cache_entries (cache_key, url, host, status, headers_json, body, stored_at, expires_at, size, content_type, hits)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+		 ON CONFLICT(cache_key) DO UPDATE SET
+			url=excluded.url,
+			host=excluded.host,
+			status=excluded.status,
+			headers_json=excluded.headers_json,
+			body=excluded.body,
+			stored_at=excluded.stored_at,
+			expires_at=excluded.expires_at,
+			size=excluded.size,
+			content_type=excluded.content_type`,
+		entry.Key, entry.URL, entry.Host, entry.Status, string(headersJSON), entry.Body,
+		entry.StoredAt.UTC().Format(time.RFC3339Nano), entry.ExpiresAt.UTC().Format(time.RFC3339Nano), entry.Size, entry.ContentType)
+	if err != nil {
+		return fmt.Errorf("save cache entry: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) LoadCacheEntry(ctx context.Context, key string) (cachepkg.StoredEntry, error) {
+	if s == nil {
+		return cachepkg.StoredEntry{}, os.ErrNotExist
+	}
+	var entry cachepkg.StoredEntry
+	var headersJSON, storedAt, expiresAt string
+	row := s.db.QueryRowContext(ctx,
+		`SELECT cache_key, url, host, status, headers_json, body, stored_at, expires_at, size, COALESCE(content_type, ''), COALESCE(hits, 0)
+		 FROM cache_entries WHERE cache_key = ?`, key)
+	if err := row.Scan(&entry.Key, &entry.URL, &entry.Host, &entry.Status, &headersJSON, &entry.Body, &storedAt, &expiresAt, &entry.Size, &entry.ContentType, &entry.Hits); err != nil {
+		if err == sql.ErrNoRows {
+			return cachepkg.StoredEntry{}, os.ErrNotExist
+		}
+		return cachepkg.StoredEntry{}, fmt.Errorf("load cache entry: %w", err)
+	}
+	if err := decodeCacheEntry(&entry, headersJSON, storedAt, expiresAt); err != nil {
+		return cachepkg.StoredEntry{}, err
+	}
+	if shouldPruneCacheEntry(entry) {
+		_ = s.DeleteCacheEntry(ctx, key)
+		return cachepkg.StoredEntry{}, os.ErrNotExist
+	}
+	entry.ViewURL = "/api/cache/resource?key=" + url.QueryEscape(entry.Key)
+	return entry, nil
+}
+
+func (s *Store) IncrementCacheHit(ctx context.Context, key string) error {
+	if s == nil {
+		return nil
+	}
+	if strings.TrimSpace(key) == "" {
+		return nil
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	_, err := s.db.ExecContext(ctx, `UPDATE cache_entries SET hits = hits + 1 WHERE cache_key = ?`, key)
+	if err != nil {
+		return fmt.Errorf("increment cache hit: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ListCacheEntries(ctx context.Context, limit, offset int, search string) (cachepkg.EntryPage, error) {
+	if s == nil {
+		return cachepkg.EntryPage{Items: []cachepkg.StoredEntry{}}, nil
+	}
+	if limit <= 0 {
+		limit = 10
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	_ = s.PruneCacheEntries(ctx)
+
+	where, args := cacheSearchWhere(search)
+	var total int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM cache_entries`+where, args...).Scan(&total); err != nil {
+		return cachepkg.EntryPage{}, fmt.Errorf("count cache entries: %w", err)
+	}
+
+	queryArgs := append(args, limit, offset)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT cache_key, url, host, status, headers_json, stored_at, expires_at, size, COALESCE(content_type, ''), COALESCE(hits, 0)
+		 FROM cache_entries`+where+` ORDER BY stored_at DESC LIMIT ? OFFSET ?`, queryArgs...)
+	if err != nil {
+		return cachepkg.EntryPage{}, fmt.Errorf("list cache entries: %w", err)
+	}
+	defer rows.Close()
+
+	items := []cachepkg.StoredEntry{}
+	for rows.Next() {
+		var entry cachepkg.StoredEntry
+		var headersJSON, storedAt, expiresAt string
+		if err := rows.Scan(&entry.Key, &entry.URL, &entry.Host, &entry.Status, &headersJSON, &storedAt, &expiresAt, &entry.Size, &entry.ContentType, &entry.Hits); err != nil {
+			return cachepkg.EntryPage{}, fmt.Errorf("scan cache entry: %w", err)
+		}
+		if err := decodeCacheEntry(&entry, headersJSON, storedAt, expiresAt); err != nil {
+			return cachepkg.EntryPage{}, err
+		}
+		entry.ViewURL = "/api/cache/resource?key=" + url.QueryEscape(entry.Key)
+		items = append(items, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return cachepkg.EntryPage{}, fmt.Errorf("iterate cache entries: %w", err)
+	}
+	return cachepkg.EntryPage{Items: items, Total: total, HasMore: offset+len(items) < total}, nil
+}
+
+func (s *Store) CacheStats(ctx context.Context) (int64, int, error) {
+	if s == nil {
+		return 0, 0, nil
+	}
+	_ = s.PruneCacheEntries(ctx)
+	var size sql.NullInt64
+	var count int
+	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(size), 0), COUNT(*) FROM cache_entries`).Scan(&size, &count); err != nil {
+		return 0, 0, fmt.Errorf("cache stats: %w", err)
+	}
+	return size.Int64, count, nil
+}
+
+func (s *Store) DeleteCacheEntry(ctx context.Context, key string) error {
+	if s == nil {
+		return nil
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	_, err := s.db.ExecContext(ctx, `DELETE FROM cache_entries WHERE cache_key = ?`, key)
+	if err != nil {
+		return fmt.Errorf("delete cache entry: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) PurgeCache(ctx context.Context, host string) (int, error) {
+	if s == nil {
+		return 0, nil
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	var result sql.Result
+	var err error
+	if strings.TrimSpace(host) == "" {
+		result, err = s.db.ExecContext(ctx, `DELETE FROM cache_entries`)
+	} else {
+		result, err = s.db.ExecContext(ctx, `DELETE FROM cache_entries WHERE host = ?`, strings.TrimSpace(host))
+	}
+	if err != nil {
+		return 0, fmt.Errorf("purge cache: %w", err)
+	}
+	removed, _ := result.RowsAffected()
+	return int(removed), nil
+}
+
+func (s *Store) PruneCacheEntries(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM cache_entries
+		 WHERE expires_at <= ? OR (status = ? AND size = 0)`,
+		time.Now().UTC().Format(time.RFC3339Nano), http.StatusNotModified)
+	if err != nil {
+		return fmt.Errorf("prune cache entries: %w", err)
+	}
+	return nil
+}
+
+func cacheSearchWhere(search string) (string, []any) {
+	term := strings.ToLower(strings.TrimSpace(search))
+	if term == "" {
+		return "", nil
+	}
+	like := "%" + term + "%"
+	return ` WHERE lower(cache_key) LIKE ?
+		OR lower(url) LIKE ?
+		OR lower(host) LIKE ?
+		OR CAST(status AS TEXT) LIKE ?
+		OR CAST(size AS TEXT) LIKE ?
+		OR lower(COALESCE(content_type, '')) LIKE ?`, []any{like, like, like, like, like, like}
+}
+
+func decodeCacheEntry(entry *cachepkg.StoredEntry, headersJSON, storedAt, expiresAt string) error {
+	entry.Headers = http.Header{}
+	if strings.TrimSpace(headersJSON) != "" {
+		if err := json.Unmarshal([]byte(headersJSON), &entry.Headers); err != nil {
+			return fmt.Errorf("decode cache headers: %w", err)
+		}
+	}
+	entry.StoredAt, _ = time.Parse(time.RFC3339Nano, storedAt)
+	entry.ExpiresAt, _ = time.Parse(time.RFC3339Nano, expiresAt)
+	if entry.ContentType == "" {
+		entry.ContentType = entry.Headers.Get("Content-Type")
+	}
+	return nil
+}
+
+func shouldPruneCacheEntry(entry cachepkg.StoredEntry) bool {
+	return (!entry.ExpiresAt.IsZero() && !entry.ExpiresAt.After(time.Now().UTC())) ||
+		(entry.Status == http.StatusNotModified && len(entry.Body) == 0)
+}
+
+func (s *Store) migrate(ctx context.Context) error {
+	statements := []string{
+		`CREATE TABLE IF NOT EXISTS traffic_flows (
+			id TEXT PRIMARY KEY,
+			created_at TEXT NOT NULL,
+			method TEXT,
+			url TEXT,
+			host TEXT,
+			status INTEGER,
+			protocol TEXT,
+			mime_type TEXT,
+			remote_ip TEXT,
+			duration_ms INTEGER,
+			bytes INTEGER,
+			cache_hit INTEGER NOT NULL DEFAULT 0,
+			blocked INTEGER NOT NULL DEFAULT 0,
+			rule_id TEXT
+		)`,
+		`CREATE TABLE IF NOT EXISTS traffic_headers (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			flow_id TEXT NOT NULL,
+			direction TEXT NOT NULL,
+			name TEXT NOT NULL,
+			value TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS traffic_bodies (
+			flow_id TEXT PRIMARY KEY,
+			request_body BLOB,
+			response_body BLOB
+		)`,
+		`CREATE TABLE IF NOT EXISTS certificates (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			host TEXT,
+			subject TEXT,
+			fingerprint TEXT,
+			created_at TEXT,
+			expires_at TEXT
+		)`,
+		`CREATE TABLE IF NOT EXISTS blocked_ports (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			port INTEGER NOT NULL,
+			reason TEXT,
+			enabled INTEGER NOT NULL DEFAULT 1
+		)`,
+		`CREATE TABLE IF NOT EXISTS blocked_domains (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			pattern TEXT NOT NULL,
+			reason TEXT,
+			enabled INTEGER NOT NULL DEFAULT 1
+		)`,
+		`CREATE TABLE IF NOT EXISTS blocked_ips (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			pattern TEXT NOT NULL,
+			reason TEXT,
+			enabled INTEGER NOT NULL DEFAULT 1
+		)`,
+		`CREATE TABLE IF NOT EXISTS deployments (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT NOT NULL,
+			kind TEXT NOT NULL,
+			config TEXT
+		)`,
+		`CREATE TABLE IF NOT EXISTS audit_log (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			created_at TEXT NOT NULL,
+			actor TEXT NOT NULL,
+			action TEXT NOT NULL,
+			details TEXT,
+			remote_ip TEXT
+		)`,
+		`CREATE TABLE IF NOT EXISTS admin_users (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT NOT NULL UNIQUE,
+			role TEXT NOT NULL DEFAULT 'read',
+			created_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS settings (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS cache_entries (
+			cache_key TEXT PRIMARY KEY,
+			url TEXT NOT NULL,
+			host TEXT NOT NULL,
+			status INTEGER NOT NULL,
+			headers_json TEXT NOT NULL,
+			body BLOB NOT NULL,
+			stored_at TEXT NOT NULL,
+			expires_at TEXT NOT NULL,
+			size INTEGER NOT NULL,
+			content_type TEXT,
+			hits INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE TABLE IF NOT EXISTS proxy_users (
+			id TEXT PRIMARY KEY,
+			username TEXT NOT NULL UNIQUE,
+			password_hash TEXT NOT NULL,
+			role TEXT NOT NULL DEFAULT 'guest',
+			enabled INTEGER NOT NULL DEFAULT 1,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			last_used_at TEXT
+		)`,
+		`CREATE TABLE IF NOT EXISTS proxy_acl_rules (
+			id TEXT PRIMARY KEY,
+			priority INTEGER NOT NULL,
+			enabled INTEGER NOT NULL DEFAULT 1,
+			action TEXT NOT NULL,
+			name TEXT NOT NULL,
+			description TEXT,
+			users_json TEXT NOT NULL,
+			roles_json TEXT NOT NULL DEFAULT '[]',
+			source_ips_json TEXT NOT NULL,
+			host_patterns_json TEXT NOT NULL,
+			port_patterns_json TEXT NOT NULL,
+			method_patterns_json TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
+	}
+
+	for _, statement := range statements {
+		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("migrate sqlite store: %w", err)
+		}
+	}
+	_ = s.addColumnIfMissing(ctx, "traffic_flows", "mime_type", "TEXT")
+	_ = s.addColumnIfMissing(ctx, "traffic_flows", "bytes", "INTEGER")
+	_ = s.addColumnIfMissing(ctx, "traffic_flows", "cache_hit", "INTEGER NOT NULL DEFAULT 0")
+	_ = s.addColumnIfMissing(ctx, "traffic_flows", "blocked", "INTEGER NOT NULL DEFAULT 0")
+	_ = s.addColumnIfMissing(ctx, "traffic_flows", "rule_id", "TEXT")
+	_ = s.addColumnIfMissing(ctx, "traffic_flows", "proxy_user", "TEXT")
+	_ = s.addColumnIfMissing(ctx, "proxy_users", "role", "TEXT NOT NULL DEFAULT 'guest'")
+	_ = s.addColumnIfMissing(ctx, "proxy_acl_rules", "roles_json", "TEXT NOT NULL DEFAULT '[]'")
+	_ = s.addColumnIfMissing(ctx, "admin_users", "role", "TEXT NOT NULL DEFAULT 'read'")
+	_ = s.addColumnIfMissing(ctx, "cache_entries", "hits", "INTEGER NOT NULL DEFAULT 0")
+	_, _ = s.db.ExecContext(ctx, `DELETE FROM certificates WHERE id NOT IN (SELECT MAX(id) FROM certificates GROUP BY COALESCE(host, ''))`)
+	_, _ = s.db.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS idx_certificates_host ON certificates(host)`)
+	_, _ = s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_traffic_headers_flow_name ON traffic_headers(flow_id, name)`)
+
+	return nil
+}
+
+func (s *Store) addColumnIfMissing(ctx context.Context, table, column, definition string) error {
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			return err
+		}
+		if name == column {
+			return nil
+		}
+	}
+	_, err = s.db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, definition))
+	return err
+}
+
+func (s *Store) AddAudit(ctx context.Context, actor, action string, details any, remoteIP string) error {
+	if s == nil {
+		return nil
+	}
+
+	var raw []byte
+	if details != nil {
+		var err error
+		raw, err = json.Marshal(details)
+		if err != nil {
+			return fmt.Errorf("marshal audit details: %w", err)
+		}
+	}
+
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO audit_log (created_at, actor, action, details, remote_ip) VALUES (?, ?, ?, ?, ?)`,
+		time.Now().UTC().Format(time.RFC3339Nano), actor, action, string(raw), remoteIP,
+	)
+	if err != nil {
+		return fmt.Errorf("insert audit entry: %w", err)
+	}
+
+	return nil
+}
+
+func (s *Store) ListAudit(ctx context.Context, limit int) ([]AuditEntry, error) {
+	if s == nil {
+		return nil, nil
+	}
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, created_at, actor, action, COALESCE(details, ''), COALESCE(remote_ip, '')
+		 FROM audit_log ORDER BY id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query audit log: %w", err)
+	}
+	defer rows.Close()
+
+	entries := []AuditEntry{}
+	for rows.Next() {
+		var entry AuditEntry
+		var createdAt string
+		var details string
+		if err := rows.Scan(&entry.ID, &createdAt, &entry.Actor, &entry.Action, &details, &entry.RemoteIP); err != nil {
+			return nil, fmt.Errorf("scan audit entry: %w", err)
+		}
+		entry.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+		if details != "" {
+			entry.Details = json.RawMessage(details)
+		}
+		entries = append(entries, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate audit entries: %w", err)
+	}
+
+	return entries, nil
+}
+
+
+
+
+func (s *Store) AddAdminUser(ctx context.Context, name, role string) (AdminUser, error) {
+	if s == nil {
+		return AdminUser{}, nil
+	}
+	if role == "" {
+		role = "read"
+	}
+	createdAt := time.Now().UTC()
+	result, err := s.db.ExecContext(ctx,
+		`INSERT INTO admin_users (name, role, created_at) VALUES (?, ?, ?)`,
+		name, role, createdAt.Format(time.RFC3339Nano))
+	if err != nil {
+		return AdminUser{}, fmt.Errorf("insert admin user: %w", err)
+	}
+	id, _ := result.LastInsertId()
+	return AdminUser{ID: id, Name: name, Role: role, CreatedAt: createdAt}, nil
+}
+
+func (s *Store) ListAdminUsers(ctx context.Context) ([]AdminUser, error) {
+	if s == nil {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, name, COALESCE(role, 'read'), created_at FROM admin_users ORDER BY id DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("query admin users: %w", err)
+	}
+	defer rows.Close()
+
+	users := []AdminUser{}
+	for rows.Next() {
+		var user AdminUser
+		var createdAt string
+		if err := rows.Scan(&user.ID, &user.Name, &user.Role, &createdAt); err != nil {
+			return nil, fmt.Errorf("scan admin user: %w", err)
+		}
+		user.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+		users = append(users, user)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate admin users: %w", err)
+	}
+	return users, nil
+}
+
+func (s *Store) DeleteAdminUser(ctx context.Context, id int64) error {
+	if s == nil {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM admin_users WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("delete admin user: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) CreateProxyUser(ctx context.Context, user ProxyUser) (ProxyUser, error) {
+	if s == nil {
+		return ProxyUser{}, nil
+	}
+	now := time.Now().UTC()
+	user.ID = strings.TrimSpace(user.ID)
+	if user.ID == "" {
+		user.ID = "proxy-user-" + newStoreID()
+	}
+	user.Username = strings.TrimSpace(user.Username)
+	if user.Username == "" {
+		return ProxyUser{}, fmt.Errorf("username is required")
+	}
+	if strings.TrimSpace(user.PasswordHash) == "" {
+		return ProxyUser{}, fmt.Errorf("password hash is required")
+	}
+	user.Role = strings.TrimSpace(user.Role)
+	if user.Role == "" {
+		user.Role = "guest"
+	}
+	user.CreatedAt = now
+	user.UpdatedAt = now
+	enabled := 0
+	if user.Enabled {
+		enabled = 1
+	}
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO proxy_users (id, username, password_hash, role, enabled, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		user.ID, user.Username, user.PasswordHash, user.Role, enabled,
+		user.CreatedAt.Format(time.RFC3339Nano), user.UpdatedAt.Format(time.RFC3339Nano))
+	if err != nil {
+		return ProxyUser{}, fmt.Errorf("insert proxy user: %w", err)
+	}
+	return user, nil
+}
+
+func (s *Store) ListProxyUsers(ctx context.Context) ([]ProxyUser, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, username, password_hash, COALESCE(role, 'guest'), enabled, created_at, updated_at, COALESCE(last_used_at, '')
+		 FROM proxy_users ORDER BY username ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("query proxy users: %w", err)
+	}
+	defer rows.Close()
+	users := []ProxyUser{}
+	for rows.Next() {
+		user, err := scanProxyUser(rows)
+		if err != nil {
+			return nil, err
+		}
+		users = append(users, user)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate proxy users: %w", err)
+	}
+	return users, nil
+}
+
+func (s *Store) GetProxyUser(ctx context.Context, id string) (ProxyUser, bool, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, username, password_hash, COALESCE(role, 'guest'), enabled, created_at, updated_at, COALESCE(last_used_at, '')
+		 FROM proxy_users WHERE id = ?`, id)
+	user, err := scanProxyUser(row)
+	if err == sql.ErrNoRows {
+		return ProxyUser{}, false, nil
+	}
+	if err != nil {
+		return ProxyUser{}, false, err
+	}
+	return user, true, nil
+}
+
+func (s *Store) GetProxyUserByUsername(ctx context.Context, username string) (ProxyUser, bool, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, username, password_hash, COALESCE(role, 'guest'), enabled, created_at, updated_at, COALESCE(last_used_at, '')
+		 FROM proxy_users WHERE username = ?`, strings.TrimSpace(username))
+	user, err := scanProxyUser(row)
+	if err == sql.ErrNoRows {
+		return ProxyUser{}, false, nil
+	}
+	if err != nil {
+		return ProxyUser{}, false, err
+	}
+	return user, true, nil
+}
+
+func (s *Store) UpdateProxyUser(ctx context.Context, user ProxyUser) (ProxyUser, error) {
+	user.Username = strings.TrimSpace(user.Username)
+	if user.ID == "" || user.Username == "" {
+		return ProxyUser{}, fmt.Errorf("proxy user id and username are required")
+	}
+	user.Role = strings.TrimSpace(user.Role)
+	if user.Role == "" {
+		user.Role = "guest"
+	}
+	enabled := 0
+	if user.Enabled {
+		enabled = 1
+	}
+	updatedAt := time.Now().UTC()
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE proxy_users SET username = ?, role = ?, enabled = ?, updated_at = ? WHERE id = ?`,
+		user.Username, user.Role, enabled, updatedAt.Format(time.RFC3339Nano), user.ID)
+	if err != nil {
+		return ProxyUser{}, fmt.Errorf("update proxy user: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ProxyUser{}, sql.ErrNoRows
+	}
+	stored, ok, err := s.GetProxyUser(ctx, user.ID)
+	if err != nil {
+		return ProxyUser{}, err
+	}
+	if !ok {
+		return ProxyUser{}, sql.ErrNoRows
+	}
+	return stored, nil
+}
+
+func (s *Store) ResetProxyUserPassword(ctx context.Context, id, passwordHash string) (ProxyUser, error) {
+	if strings.TrimSpace(passwordHash) == "" {
+		return ProxyUser{}, fmt.Errorf("password hash is required")
+	}
+	updatedAt := time.Now().UTC()
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE proxy_users SET password_hash = ?, updated_at = ? WHERE id = ?`,
+		passwordHash, updatedAt.Format(time.RFC3339Nano), id)
+	if err != nil {
+		return ProxyUser{}, fmt.Errorf("reset proxy user password: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ProxyUser{}, sql.ErrNoRows
+	}
+	user, ok, err := s.GetProxyUser(ctx, id)
+	if err != nil {
+		return ProxyUser{}, err
+	}
+	if !ok {
+		return ProxyUser{}, sql.ErrNoRows
+	}
+	return user, nil
+}
+
+func (s *Store) TouchProxyUserLastUsed(ctx context.Context, id string) error {
+	if strings.TrimSpace(id) == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE proxy_users SET last_used_at = ? WHERE id = ?`,
+		time.Now().UTC().Format(time.RFC3339Nano), id)
+	if err != nil {
+		return fmt.Errorf("touch proxy user: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) DeleteProxyUser(ctx context.Context, id string) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM proxy_users WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("delete proxy user: %w", err)
+	}
+	return nil
+}
+
+// GetUserRoles 返回用户的所有角色。当前实现是单角色，返回 []string{role}。
+func (s *Store) GetUserRoles(ctx context.Context, username string) ([]string, error) {
+	if s == nil {
+		return nil, nil
+	}
+	var role string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COALESCE(role, 'guest') FROM proxy_users WHERE username = ?`,
+		strings.TrimSpace(username)).Scan(&role)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query user roles: %w", err)
+	}
+	role = strings.TrimSpace(role)
+	if role == "" {
+		return nil, nil
+	}
+	return []string{role}, nil
+}
+
+func (s *Store) CreateProxyACLRule(ctx context.Context, rule ProxyACLRule) (ProxyACLRule, error) {
+	rule = normalizeProxyACLRule(rule)
+	now := time.Now().UTC()
+	rule.ID = strings.TrimSpace(rule.ID)
+	if rule.ID == "" {
+		rule.ID = "proxy-acl-" + newStoreID()
+	}
+	rule.CreatedAt = now
+	rule.UpdatedAt = now
+	args, err := proxyACLRuleSQLArgs(rule)
+	if err != nil {
+		return ProxyACLRule{}, err
+	}
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO proxy_acl_rules
+		 (id, priority, enabled, action, name, description, users_json, roles_json, source_ips_json, host_patterns_json, port_patterns_json, method_patterns_json, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, args...)
+	if err != nil {
+		return ProxyACLRule{}, fmt.Errorf("insert proxy acl rule: %w", err)
+	}
+	return rule, nil
+}
+
+func (s *Store) ListProxyACLRules(ctx context.Context) ([]ProxyACLRule, error) {
+	rows, err := s.db.QueryContext(ctx, proxyACLRuleSelect()+` ORDER BY priority ASC, created_at ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("query proxy acl rules: %w", err)
+	}
+	defer rows.Close()
+	rules := []ProxyACLRule{}
+	for rows.Next() {
+		rule, err := scanProxyACLRule(rows)
+		if err != nil {
+			return nil, err
+		}
+		rules = append(rules, rule)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate proxy acl rules: %w", err)
+	}
+	return rules, nil
+}
+
+func (s *Store) GetProxyACLRule(ctx context.Context, id string) (ProxyACLRule, bool, error) {
+	row := s.db.QueryRowContext(ctx, proxyACLRuleSelect()+` WHERE id = ?`, id)
+	rule, err := scanProxyACLRule(row)
+	if err == sql.ErrNoRows {
+		return ProxyACLRule{}, false, nil
+	}
+	if err != nil {
+		return ProxyACLRule{}, false, err
+	}
+	return rule, true, nil
+}
+
+func (s *Store) UpdateProxyACLRule(ctx context.Context, rule ProxyACLRule) (ProxyACLRule, error) {
+	rule = normalizeProxyACLRule(rule)
+	rule.UpdatedAt = time.Now().UTC()
+	args, err := proxyACLRuleSQLArgs(rule)
+	if err != nil {
+		return ProxyACLRule{}, err
+	}
+	updateArgs := []any{args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[13], rule.ID}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE proxy_acl_rules
+		 SET priority = ?, enabled = ?, action = ?, name = ?, description = ?, users_json = ?, roles_json = ?, source_ips_json = ?, host_patterns_json = ?, port_patterns_json = ?, method_patterns_json = ?, updated_at = ?
+		 WHERE id = ?`, updateArgs...)
+	if err != nil {
+		return ProxyACLRule{}, fmt.Errorf("update proxy acl rule: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ProxyACLRule{}, sql.ErrNoRows
+	}
+	stored, ok, err := s.GetProxyACLRule(ctx, rule.ID)
+	if err != nil {
+		return ProxyACLRule{}, err
+	}
+	if !ok {
+		return ProxyACLRule{}, sql.ErrNoRows
+	}
+	return stored, nil
+}
+
+func (s *Store) DeleteProxyACLRule(ctx context.Context, id string) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM proxy_acl_rules WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("delete proxy acl rule: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) RecordEvent(ctx context.Context, event events.Event) error {
+	if s == nil {
+		return nil
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	var err error
+	switch event.Topic {
+	case events.TopicTrafficRequestStarted:
+		err = s.recordTrafficStarted(ctx, event)
+	case events.TopicTrafficResponseCompleted:
+		err = s.recordTrafficCompleted(ctx, event)
+	case events.TopicTrafficTunnelOpened:
+		err = s.recordTunnelOpened(ctx, event)
+	case events.TopicTrafficBlocked:
+		err = s.recordTrafficBlocked(ctx, event)
+	case events.TopicTrafficBodyCaptured:
+		err = s.recordTrafficBody(ctx, event)
+	case events.TopicCertGenerated:
+		err = s.recordCertificate(ctx, event)
+	}
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Store) ListTraffic(ctx context.Context, limit int) ([]TrafficFlow, error) {
+	return s.ListTrafficPage(ctx, limit, 0, "")
+}
+
+func (s *Store) ListTrafficPage(ctx context.Context, limit, offset int, search string) ([]TrafficFlow, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 200
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	where := ""
+	args := []any{}
+	if search = strings.TrimSpace(search); search != "" {
+		searchWhere := `(LOWER(COALESCE(method, '')) LIKE ? OR LOWER(COALESCE(url, '')) LIKE ? OR LOWER(COALESCE(host, '')) LIKE ? OR CAST(COALESCE(status, 0) AS TEXT) LIKE ? OR LOWER(COALESCE(protocol, '')) LIKE ? OR LOWER(COALESCE(mime_type, '')) LIKE ? OR LOWER(COALESCE(rule_id, '')) LIKE ? OR LOWER(COALESCE(proxy_user, '')) LIKE ?)`
+		where = " WHERE " + searchWhere
+		term := "%" + strings.ToLower(search) + "%"
+		args = append(args, term, term, term, term, term, term, term, term)
+	}
+	args = append(args, limit, offset)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, created_at, COALESCE(method, ''), COALESCE(url, ''), COALESCE(host, ''),
+		 COALESCE(status, 0), COALESCE(protocol, ''), COALESCE(mime_type, ''), COALESCE(remote_ip, ''),
+		 COALESCE(duration_ms, 0), COALESCE(bytes, 0), cache_hit, blocked, COALESCE(rule_id, ''), COALESCE(proxy_user, '')
+		 FROM traffic_flows`+where+` ORDER BY created_at DESC LIMIT ? OFFSET ?`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query traffic flows: %w", err)
+	}
+	defer rows.Close()
+
+	flows := []TrafficFlow{}
+	for rows.Next() {
+		flow, err := scanTrafficFlow(rows)
+		if err != nil {
+			return nil, err
+		}
+		flows = append(flows, flow)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate traffic flows: %w", err)
+	}
+	return flows, nil
+}
+
+func (s *Store) GetTraffic(ctx context.Context, id string) (TrafficFlow, bool, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, created_at, COALESCE(method, ''), COALESCE(url, ''), COALESCE(host, ''),
+		 COALESCE(status, 0), COALESCE(protocol, ''), COALESCE(mime_type, ''), COALESCE(remote_ip, ''),
+		 COALESCE(duration_ms, 0), COALESCE(bytes, 0), cache_hit, blocked, COALESCE(rule_id, ''), COALESCE(proxy_user, '')
+		 FROM traffic_flows WHERE id = ?`, id)
+
+	flow, err := scanTrafficFlow(row)
+	if err == sql.ErrNoRows {
+		return TrafficFlow{}, false, nil
+	}
+	if err != nil {
+		return TrafficFlow{}, false, err
+	}
+	return flow, true, nil
+}
+
+func (s *Store) GetTrafficDetail(ctx context.Context, id string) (TrafficDetail, bool, error) {
+	flow, ok, err := s.GetTraffic(ctx, id)
+	if err != nil || !ok {
+		return TrafficDetail{}, ok, err
+	}
+
+	headers, err := s.ListTrafficHeaders(ctx, id)
+	if err != nil {
+		return TrafficDetail{}, false, err
+	}
+	requestBody, responseBody, err := s.getTrafficBodies(ctx, id)
+	if err != nil {
+		return TrafficDetail{}, false, err
+	}
+	return trafficDetailFromParts(flow, headers, requestBody, responseBody), true, nil
+}
+
+func (s *Store) ListTrafficDetailsPage(ctx context.Context, limit, offset int, search string) ([]TrafficDetail, error) {
+	flows, err := s.ListTrafficPage(ctx, limit, offset, search)
+	if err != nil {
+		return nil, err
+	}
+	if len(flows) == 0 {
+		return []TrafficDetail{}, nil
+	}
+
+	ids := make([]string, 0, len(flows))
+	details := make([]TrafficDetail, len(flows))
+	indexByID := make(map[string]int, len(flows))
+	for i, flow := range flows {
+		ids = append(ids, flow.ID)
+		indexByID[flow.ID] = i
+		details[i] = TrafficDetail{
+			TrafficFlow: flow,
+			QueryParams: map[string][]string{},
+			Cookies:     map[string]string{},
+		}
+		if parsed, err := url.Parse(flow.URL); err == nil {
+			details[i].QueryParams = parsed.Query()
+		}
+	}
+
+	headersByFlow, err := s.listTrafficHeadersForFlows(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	for flowID, headers := range headersByFlow {
+		if i, ok := indexByID[flowID]; ok {
+			details[i].Headers = headers
+			populateTrafficCookies(&details[i])
+		}
+	}
+
+	bodiesByFlow, err := s.listTrafficBodiesForFlows(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	for flowID, bodies := range bodiesByFlow {
+		if i, ok := indexByID[flowID]; ok {
+			details[i].RequestBody = bodies.request
+			details[i].ResponseBody = bodies.response
+		}
+	}
+
+	return details, nil
+}
+
+func trafficDetailFromParts(flow TrafficFlow, headers []HeaderRecord, requestBody, responseBody string) TrafficDetail {
+	detail := TrafficDetail{
+		TrafficFlow:  flow,
+		Headers:      headers,
+		QueryParams:  map[string][]string{},
+		Cookies:      map[string]string{},
+		RequestBody:  requestBody,
+		ResponseBody: responseBody,
+	}
+	if parsed, err := url.Parse(flow.URL); err == nil {
+		detail.QueryParams = parsed.Query()
+	}
+	populateTrafficCookies(&detail)
+	return detail
+}
+
+func populateTrafficCookies(detail *TrafficDetail) {
+	if detail.Cookies == nil {
+		detail.Cookies = map[string]string{}
+	}
+	for _, header := range detail.Headers {
+		if header.Direction != "request" || !strings.EqualFold(header.Name, "Cookie") {
+			continue
+		}
+		for _, part := range strings.Split(header.Value, ";") {
+			name, value, ok := strings.Cut(strings.TrimSpace(part), "=")
+			if ok && name != "" {
+				detail.Cookies[name] = value
+			}
+		}
+	}
+}
+
+func (s *Store) getTrafficBodies(ctx context.Context, id string) (string, string, error) {
+	var requestBody, responseBody []byte
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COALESCE(request_body, ''), COALESCE(response_body, '') FROM traffic_bodies WHERE flow_id = ?`, id).
+		Scan(&requestBody, &responseBody)
+	if err == sql.ErrNoRows {
+		return "", "", nil
+	}
+	if err != nil {
+		return "", "", fmt.Errorf("query traffic bodies: %w", err)
+	}
+	return string(requestBody), string(responseBody), nil
+}
+
+func (s *Store) ListTrafficHeaders(ctx context.Context, flowID string) ([]HeaderRecord, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT direction, name, value FROM traffic_headers WHERE flow_id = ? ORDER BY id ASC`, flowID)
+	if err != nil {
+		return nil, fmt.Errorf("query traffic headers: %w", err)
+	}
+	defer rows.Close()
+
+	headers := []HeaderRecord{}
+	for rows.Next() {
+		var header HeaderRecord
+		if err := rows.Scan(&header.Direction, &header.Name, &header.Value); err != nil {
+			return nil, fmt.Errorf("scan traffic header: %w", err)
+		}
+		headers = append(headers, header)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate traffic headers: %w", err)
+	}
+	return headers, nil
+}
+
+func (s *Store) listTrafficHeadersForFlows(ctx context.Context, flowIDs []string) (map[string][]HeaderRecord, error) {
+	out := make(map[string][]HeaderRecord, len(flowIDs))
+	if len(flowIDs) == 0 {
+		return out, nil
+	}
+	placeholders, args := stringPlaceholders(flowIDs)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT flow_id, direction, name, value FROM traffic_headers WHERE flow_id IN (`+placeholders+`) ORDER BY flow_id ASC, id ASC`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query traffic headers: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var flowID string
+		var header HeaderRecord
+		if err := rows.Scan(&flowID, &header.Direction, &header.Name, &header.Value); err != nil {
+			return nil, fmt.Errorf("scan traffic header: %w", err)
+		}
+		out[flowID] = append(out[flowID], header)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate traffic headers: %w", err)
+	}
+	return out, nil
+}
+
+type trafficBodies struct {
+	request  string
+	response string
+}
+
+func (s *Store) listTrafficBodiesForFlows(ctx context.Context, flowIDs []string) (map[string]trafficBodies, error) {
+	out := make(map[string]trafficBodies, len(flowIDs))
+	if len(flowIDs) == 0 {
+		return out, nil
+	}
+	placeholders, args := stringPlaceholders(flowIDs)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT flow_id, COALESCE(request_body, ''), COALESCE(response_body, '') FROM traffic_bodies WHERE flow_id IN (`+placeholders+`)`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query traffic bodies: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var flowID string
+		var requestBody, responseBody []byte
+		if err := rows.Scan(&flowID, &requestBody, &responseBody); err != nil {
+			return nil, fmt.Errorf("scan traffic bodies: %w", err)
+		}
+		out[flowID] = trafficBodies{request: string(requestBody), response: string(responseBody)}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate traffic bodies: %w", err)
+	}
+	return out, nil
+}
+
+func stringPlaceholders(values []string) (string, []any) {
+	var b strings.Builder
+	args := make([]any, 0, len(values))
+	for i, value := range values {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteByte('?')
+		args = append(args, value)
+	}
+	return b.String(), args
+}
+
+func (s *Store) ClearTraffic(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM traffic_headers`); err != nil {
+		return fmt.Errorf("clear traffic headers: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM traffic_bodies`); err != nil {
+		return fmt.Errorf("clear traffic bodies: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM traffic_flows`); err != nil {
+		return fmt.Errorf("clear traffic flows: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) PurgeResearchData(ctx context.Context, includeCache bool) error {
+	if s == nil {
+		return nil
+	}
+	tables := []string{
+		"traffic_headers",
+		"traffic_bodies",
+		"traffic_flows",
+		"certificates",
+		"blocked_ports",
+		"blocked_domains",
+		"blocked_ips",
+		"deployments",
+		"audit_log",
+	}
+	if includeCache {
+		tables = append(tables, "cache_entries", "proxy_acl_rules", "proxy_users")
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	for _, table := range tables {
+		if _, err := s.db.ExecContext(ctx, "DELETE FROM "+table); err != nil {
+			return fmt.Errorf("purge %s: %w", table, err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) ListCertificates(ctx context.Context, limit int) ([]CertificateRecord, error) {
+	page, err := s.ListCertificatesPage(ctx, limit, 0, "")
+	if err != nil {
+		return nil, err
+	}
+	return page.Items, nil
+}
+
+func (s *Store) ListCertificatesPage(ctx context.Context, limit, offset int, search string) (CertificatePage, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	where, args := certificateSearchWhere(search)
+	var total int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM certificates`+where, args...).Scan(&total); err != nil {
+		return CertificatePage{}, fmt.Errorf("count certificates: %w", err)
+	}
+
+	queryArgs := append(args, limit, offset)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, COALESCE(host, ''), COALESCE(subject, ''), COALESCE(fingerprint, ''),
+		 COALESCE(created_at, ''), COALESCE(expires_at, '')
+		 FROM certificates`+where+` ORDER BY id DESC LIMIT ? OFFSET ?`, queryArgs...)
+	if err != nil {
+		return CertificatePage{}, fmt.Errorf("query certificates: %w", err)
+	}
+	defer rows.Close()
+
+	records := []CertificateRecord{}
+	for rows.Next() {
+		var record CertificateRecord
+		var createdAt, expiresAt string
+		if err := rows.Scan(&record.ID, &record.Host, &record.Subject, &record.Fingerprint, &createdAt, &expiresAt); err != nil {
+			return CertificatePage{}, fmt.Errorf("scan certificate: %w", err)
+		}
+		record.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+		record.ExpiresAt, _ = time.Parse(time.RFC3339Nano, expiresAt)
+		records = append(records, record)
+	}
+	if err := rows.Err(); err != nil {
+		return CertificatePage{}, fmt.Errorf("iterate certificates: %w", err)
+	}
+	return CertificatePage{Items: records, Total: total, HasMore: offset+len(records) < total}, nil
+}
+
+func certificateSearchWhere(search string) (string, []any) {
+	term := strings.ToLower(strings.TrimSpace(search))
+	if term == "" {
+		return "", nil
+	}
+	like := "%" + term + "%"
+	return ` WHERE lower(COALESCE(host, '')) LIKE ?
+		OR lower(COALESCE(subject, '')) LIKE ?
+		OR lower(COALESCE(fingerprint, '')) LIKE ?
+		OR lower(COALESCE(created_at, '')) LIKE ?
+		OR lower(COALESCE(expires_at, '')) LIKE ?`, []any{like, like, like, like, like}
+}
+
+func (s *Store) TrafficStats(ctx context.Context) (TrafficStats, error) {
+	var stats TrafficStats
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*), COALESCE(SUM(blocked), 0), COALESCE(SUM(cache_hit), 0) FROM traffic_flows`).
+		Scan(&stats.Total, &stats.Blocked, &stats.CacheHit)
+	if err != nil {
+		return TrafficStats{}, fmt.Errorf("query traffic stats: %w", err)
+	}
+	return stats, nil
+}
+
+func (s *Store) SetSetting(ctx context.Context, key string, value any) error {
+	if s == nil {
+		return nil
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Errorf("marshal setting: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO settings (key, value) VALUES (?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+		key, string(encoded))
+	if err != nil {
+		return fmt.Errorf("store setting: %w", err)
+	}
+	return nil
+}
+
+
+
+
+
+
+type trafficScanner interface {
+	Scan(dest ...any) error
+}
+
+
+
+func scanProxyUser(row trafficScanner) (ProxyUser, error) {
+	var user ProxyUser
+	var enabled int
+	var createdAt, updatedAt, lastUsedAt string
+	if err := row.Scan(&user.ID, &user.Username, &user.PasswordHash, &user.Role, &enabled, &createdAt, &updatedAt, &lastUsedAt); err != nil {
+		return ProxyUser{}, err
+	}
+	user.Role = strings.TrimSpace(user.Role)
+	if user.Role == "" {
+		user.Role = "guest"
+	}
+	user.Enabled = enabled != 0
+	user.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+	user.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
+	if parsed, err := time.Parse(time.RFC3339Nano, lastUsedAt); err == nil {
+		user.LastUsedAt = &parsed
+	}
+	return user, nil
+}
+
+func proxyACLRuleSelect() string {
+	return `SELECT id, priority, enabled, action, name, COALESCE(description, ''), users_json, roles_json, source_ips_json, host_patterns_json, port_patterns_json, method_patterns_json, created_at, updated_at FROM proxy_acl_rules`
+}
+
+func scanProxyACLRule(row trafficScanner) (ProxyACLRule, error) {
+	var rule ProxyACLRule
+	var enabled int
+	var usersJSON, rolesJSON, sourceIPsJSON, hostJSON, portJSON, methodJSON string
+	var createdAt, updatedAt string
+	if err := row.Scan(&rule.ID, &rule.Priority, &enabled, &rule.Action, &rule.Name, &rule.Description, &usersJSON, &rolesJSON, &sourceIPsJSON, &hostJSON, &portJSON, &methodJSON, &createdAt, &updatedAt); err != nil {
+		return ProxyACLRule{}, err
+	}
+	rule.Enabled = enabled != 0
+	rule.Users = unmarshalStringList(usersJSON)
+	rule.Roles = unmarshalStringList(rolesJSON)
+	rule.SourceIPs = unmarshalStringList(sourceIPsJSON)
+	rule.HostPatterns = unmarshalStringList(hostJSON)
+	rule.PortPatterns = unmarshalStringList(portJSON)
+	rule.MethodPatterns = unmarshalStringList(methodJSON)
+	rule.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+	rule.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
+	return normalizeProxyACLRule(rule), nil
+}
+
+func normalizeProxyACLRule(rule ProxyACLRule) ProxyACLRule {
+	rule.ID = strings.TrimSpace(rule.ID)
+	rule.Action = strings.ToLower(strings.TrimSpace(rule.Action))
+	if rule.Action == "" {
+		rule.Action = "deny"
+	}
+	rule.Name = strings.TrimSpace(rule.Name)
+	if rule.Name == "" {
+		rule.Name = rule.Action + " rule"
+	}
+	rule.Description = strings.TrimSpace(rule.Description)
+	rule.Users = normalizeStringList(rule.Users, false)
+	rule.Roles = normalizeStringList(rule.Roles, false)
+	rule.SourceIPs = normalizeStringList(rule.SourceIPs, false)
+	rule.HostPatterns = normalizeStringList(rule.HostPatterns, true)
+	rule.PortPatterns = normalizeStringList(rule.PortPatterns, false)
+	rule.MethodPatterns = normalizeStringList(rule.MethodPatterns, true)
+	return rule
+}
+
+func normalizeStringList(values []string, upper bool) []string {
+	out := []string{}
+	seen := map[string]bool{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if upper {
+			value = strings.ToUpper(value)
+		}
+		key := strings.ToLower(value)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func proxyACLRuleSQLArgs(rule ProxyACLRule) ([]any, error) {
+	if rule.Action != "allow" && rule.Action != "deny" {
+		return nil, fmt.Errorf("proxy ACL action must be allow or deny")
+	}
+	lists := [][]string{rule.Users, rule.Roles, rule.SourceIPs, rule.HostPatterns, rule.PortPatterns, rule.MethodPatterns}
+	encoded := make([]string, 0, len(lists))
+	for _, list := range lists {
+		raw, err := json.Marshal(list)
+		if err != nil {
+			return nil, fmt.Errorf("marshal proxy ACL rule: %w", err)
+		}
+		encoded = append(encoded, string(raw))
+	}
+	enabled := 0
+	if rule.Enabled {
+		enabled = 1
+	}
+	return []any{
+		rule.ID, rule.Priority, enabled, rule.Action, rule.Name, rule.Description,
+		encoded[0], encoded[1], encoded[2], encoded[3], encoded[4], encoded[5],
+		rule.CreatedAt.Format(time.RFC3339Nano), rule.UpdatedAt.Format(time.RFC3339Nano),
+	}, nil
+}
+
+func unmarshalStringList(raw string) []string {
+	out := []string{}
+	_ = json.Unmarshal([]byte(raw), &out)
+	return out
+}
+
+func scanTrafficFlow(row trafficScanner) (TrafficFlow, error) {
+	var flow TrafficFlow
+	var createdAt string
+	var cacheHit, blocked int
+	if err := row.Scan(&flow.ID, &createdAt, &flow.Method, &flow.URL, &flow.Host, &flow.Status, &flow.Protocol, &flow.MIMEType, &flow.RemoteIP, &flow.DurationMS, &flow.Bytes, &cacheHit, &blocked, &flow.RuleID, &flow.ProxyUser); err != nil {
+		return TrafficFlow{}, err
+	}
+	flow.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+	flow.CacheHit = cacheHit != 0
+	flow.Blocked = blocked != 0
+	return flow, nil
+}
+
+func (s *Store) recordTrafficStarted(ctx context.Context, event events.Event) error {
+	method := stringPayload(event, "method")
+	rawURL := stringPayload(event, "url")
+	host := stringPayload(event, "host")
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO traffic_flows (id, created_at, method, url, host, protocol, remote_ip, proxy_user)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''))
+		 ON CONFLICT(id) DO UPDATE SET method=excluded.method, url=excluded.url, host=excluded.host, protocol=excluded.protocol, remote_ip=excluded.remote_ip, proxy_user=COALESCE(excluded.proxy_user, traffic_flows.proxy_user)`,
+		flowID(event), event.Time.Format(time.RFC3339Nano), method, rawURL, host, stringPayload(event, "protocol"), stringPayload(event, "remote_ip"), stringPayload(event, "proxy_user"))
+	if err != nil {
+		return fmt.Errorf("record traffic start: %w", err)
+	}
+	if err := s.recordHeaders(ctx, flowID(event), "request", event.Payload["request_headers"]); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Store) recordTrafficCompleted(ctx context.Context, event events.Event) error {
+	method := stringPayload(event, "method")
+	rawURL := stringPayload(event, "url")
+	host := stringPayload(event, "host")
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO traffic_flows (id, created_at, method, url, host, status, mime_type, duration_ms, bytes, cache_hit, proxy_user)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''))
+		 ON CONFLICT(id) DO UPDATE SET status=excluded.status, mime_type=excluded.mime_type, duration_ms=excluded.duration_ms, bytes=excluded.bytes, cache_hit=excluded.cache_hit, proxy_user=COALESCE(excluded.proxy_user, traffic_flows.proxy_user)`,
+		flowID(event), event.Time.Format(time.RFC3339Nano), method, rawURL, host, intPayload(event, "status"), stringPayload(event, "mime_type"), intPayload(event, "duration_ms"), intPayload(event, "bytes"), boolPayload(event, "cache_hit"), stringPayload(event, "proxy_user"))
+	if err != nil {
+		return fmt.Errorf("record traffic completion: %w", err)
+	}
+	if err := s.recordHeaders(ctx, flowID(event), "response", event.Payload["response_headers"]); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Store) recordTunnelOpened(ctx context.Context, event events.Event) error {
+	target := stringPayload(event, "target")
+	host := target
+	if parsed, err := url.Parse("//" + target); err == nil {
+		host = parsed.Hostname()
+	}
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO traffic_flows (id, created_at, method, url, host, protocol, remote_ip, proxy_user)
+		 VALUES (?, ?, 'CONNECT', ?, ?, ?, ?, NULLIF(?, ''))`,
+		flowID(event), event.Time.Format(time.RFC3339Nano), target, host, stringPayload(event, "protocol"), stringPayload(event, "remote_ip"), stringPayload(event, "proxy_user"))
+	if err != nil {
+		return fmt.Errorf("record tunnel: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) recordHeaders(ctx context.Context, flowID, direction string, value any) error {
+	headers, ok := value.(map[string]any)
+	if !ok {
+		return nil
+	}
+
+	for name, rawValues := range headers {
+		switch values := rawValues.(type) {
+		case []string:
+			for _, headerValue := range values {
+				if err := s.insertHeader(ctx, flowID, direction, name, headerValue); err != nil {
+					return err
+				}
+			}
+		case []any:
+			for _, headerValue := range values {
+				if err := s.insertHeader(ctx, flowID, direction, name, fmt.Sprint(headerValue)); err != nil {
+					return err
+				}
+			}
+		case string:
+			if err := s.insertHeader(ctx, flowID, direction, name, values); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Store) insertHeader(ctx context.Context, flowID, direction, name, value string) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO traffic_headers (flow_id, direction, name, value) VALUES (?, ?, ?, ?)`,
+		flowID, direction, name, value)
+	if err != nil {
+		return fmt.Errorf("record traffic header: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) recordTrafficBlocked(ctx context.Context, event events.Event) error {
+	method := stringPayload(event, "method")
+	rawURL := firstStringPayload(event, "url", "target")
+	host := stringPayload(event, "host")
+	status := intPayload(event, "status")
+	if status == 0 {
+		status = 403
+	}
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO traffic_flows (id, created_at, method, url, host, blocked, rule_id, status, proxy_user, remote_ip)
+		 VALUES (?, ?, ?, ?, ?, 1, ?, ?, NULLIF(?, ''), NULLIF(?, ''))
+		 ON CONFLICT(id) DO UPDATE SET blocked=1, rule_id=excluded.rule_id, status=excluded.status, proxy_user=COALESCE(excluded.proxy_user, traffic_flows.proxy_user), remote_ip=COALESCE(excluded.remote_ip, traffic_flows.remote_ip)`,
+		flowID(event), event.Time.Format(time.RFC3339Nano), method, rawURL, host, stringPayload(event, "rule_id"), status, stringPayload(event, "proxy_user"), stringPayload(event, "remote_ip"))
+	if err != nil {
+		return fmt.Errorf("record blocked traffic: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) recordTrafficBody(ctx context.Context, event events.Event) error {
+	flowID := flowID(event)
+	direction := stringPayload(event, "direction")
+	body := []byte(stringPayload(event, "body"))
+
+	column := "request_body"
+	if direction == "response" {
+		column = "response_body"
+	}
+
+	_, err := s.db.ExecContext(ctx,
+		fmt.Sprintf(`INSERT INTO traffic_bodies (flow_id, %s) VALUES (?, ?)
+		 ON CONFLICT(flow_id) DO UPDATE SET %s=excluded.%s`, column, column, column),
+		flowID, body)
+	if err != nil {
+		return fmt.Errorf("record traffic body: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) recordCertificate(ctx context.Context, event events.Event) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO certificates (host, subject, fingerprint, created_at, expires_at)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(host) DO UPDATE SET
+			subject=excluded.subject,
+			fingerprint=excluded.fingerprint,
+			created_at=excluded.created_at,
+			expires_at=excluded.expires_at`,
+		stringPayload(event, "host"), stringPayload(event, "subject"), stringPayload(event, "fingerprint"), stringPayload(event, "created_at"), stringPayload(event, "expires_at"))
+	if err != nil {
+		return fmt.Errorf("record certificate: %w", err)
+	}
+	return nil
+}
+
+func flowID(event events.Event) string {
+	if event.RequestID != "" {
+		return event.RequestID
+	}
+	return event.ID
+}
+
+func stringPayload(event events.Event, key string) string {
+	value, ok := event.Payload[key]
+	if !ok || value == nil {
+		return ""
+	}
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case fmt.Stringer:
+		return typed.String()
+	default:
+		return fmt.Sprint(typed)
+	}
+}
+
+func firstStringPayload(event events.Event, keys ...string) string {
+	for _, key := range keys {
+		if value := stringPayload(event, key); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func intPayload(event events.Event, key string) int64 {
+	value, ok := event.Payload[key]
+	if !ok || value == nil {
+		return 0
+	}
+	switch typed := value.(type) {
+	case int:
+		return int64(typed)
+	case int64:
+		return typed
+	case float64:
+		return int64(typed)
+	default:
+		return 0
+	}
+}
+
+func boolPayload(event events.Event, key string) int {
+	value, ok := event.Payload[key]
+	if !ok || value == nil {
+		return 0
+	}
+	if typed, ok := value.(bool); ok && typed {
+		return 1
+	}
+	return 0
+}
+
+func boolInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func newStoreID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
+}
